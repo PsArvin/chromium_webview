@@ -4,22 +4,33 @@
 
 package org.chromium.ui.base;
 
+import android.annotation.SuppressLint;
 import android.content.ClipData;
+import android.content.ClipDescription;
 import android.content.ClipboardManager;
 import android.content.Context;
-import android.widget.Toast;
+import android.text.Html;
+import android.text.Spanned;
+import android.text.style.CharacterStyle;
+import android.text.style.ParagraphStyle;
+import android.text.style.UpdateAppearance;
 
 import org.chromium.base.ApiCompatibilityUtils;
-import org.chromium.base.CalledByNative;
-import org.chromium.base.JNINamespace;
+import org.chromium.base.ContextUtils;
+import org.chromium.base.annotations.CalledByNative;
+import org.chromium.base.annotations.JNINamespace;
+import org.chromium.base.metrics.RecordUserAction;
 import org.chromium.ui.R;
+import org.chromium.ui.widget.Toast;
 
 /**
- * Simple proxy that provides C++ code with an access pathway to the Android
- * clipboard.
+ * Simple proxy that provides C++ code with an access pathway to the Android clipboard.
  */
 @JNINamespace("ui")
-public class Clipboard {
+public class Clipboard implements ClipboardManager.OnPrimaryClipChangedListener {
+    @SuppressLint("StaticFieldLeak")
+    private static Clipboard sInstance;
+
     // Necessary for coercing clipboard contents to text if they require
     // access to network resources, etceteras (e.g., URI in clipboard)
     private final Context mContext;
@@ -27,25 +38,22 @@ public class Clipboard {
     private final ClipboardManager mClipboardManager;
 
     /**
-     * Use the factory constructor instead.
-     *
-     * @param context for accessing the clipboard
-     */
-    public Clipboard(final Context context) {
-        mContext = context;
-        mClipboardManager = (ClipboardManager)
-                context.getSystemService(Context.CLIPBOARD_SERVICE);
-    }
-
-    /**
-     * Returns a new Clipboard object bound to the specified context.
-     *
-     * @param context for accessing the clipboard
-     * @return the new object
+     * Get the singleton Clipboard instance (creating it if needed).
      */
     @CalledByNative
-    private static Clipboard create(final Context context) {
-        return new Clipboard(context);
+    public static Clipboard getInstance() {
+        if (sInstance == null) {
+            sInstance = new Clipboard();
+        }
+        return sInstance;
+    }
+
+    private Clipboard() {
+        mContext = ContextUtils.getApplicationContext();
+        mClipboardManager =
+                (ClipboardManager) ContextUtils.getApplicationContext().getSystemService(
+                        Context.CLIPBOARD_SERVICE);
+        mClipboardManager.addPrimaryClipChangedListener(this);
     }
 
     /**
@@ -67,11 +75,42 @@ public class Clipboard {
     @SuppressWarnings("javadoc")
     @CalledByNative
     private String getCoercedText() {
-        final ClipData clip = mClipboardManager.getPrimaryClip();
-        if (clip != null && clip.getItemCount() > 0) {
-            final CharSequence sequence = clip.getItemAt(0).coerceToText(mContext);
-            if (sequence != null) {
-                return sequence.toString();
+        // getPrimaryClip() has been observed to throw unexpected exceptions for some devices (see
+        // crbug.com/654802 and b/31501780)
+        try {
+            return mClipboardManager.getPrimaryClip()
+                    .getItemAt(0)
+                    .coerceToText(mContext)
+                    .toString();
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private boolean hasStyleSpan(Spanned spanned) {
+        Class<?>[] styleClasses = {
+                CharacterStyle.class, ParagraphStyle.class, UpdateAppearance.class};
+        for (Class<?> clazz : styleClasses) {
+            if (spanned.nextSpanTransition(-1, spanned.length(), clazz) < spanned.length()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    public String clipDataToHtmlText(ClipData clipData) {
+        ClipDescription description = clipData.getDescription();
+        if (description.hasMimeType(ClipDescription.MIMETYPE_TEXT_HTML)) {
+            return clipData.getItemAt(0).getHtmlText();
+        }
+
+        if (description.hasMimeType(ClipDescription.MIMETYPE_TEXT_PLAIN)) {
+            CharSequence text = clipData.getItemAt(0).getText();
+            if (!(text instanceof Spanned)) return null;
+            Spanned spanned = (Spanned) text;
+            if (hasStyleSpan(spanned)) {
+                return ApiCompatibilityUtils.toHtml(
+                        spanned, Html.TO_HTML_PARAGRAPH_LINES_CONSECUTIVE);
             }
         }
         return null;
@@ -85,13 +124,14 @@ public class Clipboard {
      */
     @CalledByNative
     private String getHTMLText() {
-        if (isHTMLClipboardSupported()) {
-            final ClipData clip = mClipboardManager.getPrimaryClip();
-            if (clip != null && clip.getItemCount() > 0) {
-                return clip.getItemAt(0).getHtmlText();
-            }
+        // getPrimaryClip() has been observed to throw unexpected exceptions for some devices (see
+        // crbug/654802 and b/31501780)
+        try {
+            ClipData clipData = mClipboardManager.getPrimaryClip();
+            return clipDataToHtmlText(clipData);
+        } catch (Exception e) {
+            return null;
         }
-        return null;
     }
 
     /**
@@ -99,61 +139,35 @@ public class Clipboard {
      * {@link android.text.ClipboardManager#setText(CharSequence)}, setting the
      * clipboard's current primary clip to a plain-text clip that consists of
      * the specified string.
-     *
-     * @param label will become the label of the clipboard's primary clip
      * @param text  will become the content of the clipboard's primary clip
-     */
-    public void setText(final String label, final String text) {
-        setPrimaryClipNoException(ClipData.newPlainText(label, text));
-    }
-
-    /**
-     * Emulates the behavior of the now-deprecated
-     * {@link android.text.ClipboardManager#setText(CharSequence)}, setting the
-     * clipboard's current primary clip to a plain-text clip that consists of
-     * the specified string.
-     *
-     * @param text will become the content of the clipboard's primary clip
      */
     @CalledByNative
     public void setText(final String text) {
-        setText(null, text);
+        setPrimaryClipNoException(ClipData.newPlainText("text", text));
     }
 
     /**
      * Writes HTML to the clipboard, together with a plain-text representation
-     * of that very data. This API is only available in Android JellyBean+ and
-     * will be a no-operation in older versions.
+     * of that very data.
      *
      * @param html  The HTML content to be pasted to the clipboard.
-     * @param label The Plain-text label for the HTML content.
      * @param text  Plain-text representation of the HTML content.
      */
-    public void setHTMLText(final String html, final String label, final String text) {
-        if (isHTMLClipboardSupported()) {
-            setPrimaryClipNoException(ClipData.newHtmlText(label, text, html));
-        }
+    @CalledByNative
+    private void setHTMLText(final String html, final String text) {
+        setPrimaryClipNoException(ClipData.newHtmlText("html", text, html));
     }
 
     /**
-     * Writes HTML to the clipboard, together with a plain-text representation
-     * of that very data. This API is only available in Android JellyBean+ and
-     * will be a no-operation in older versions.
+     * Clears the Clipboard Primary clip.
      *
-     * @param html The HTML content to be pasted to the clipboard.
-     * @param text Plain-text representation of the HTML content.
      */
     @CalledByNative
-    public void setHTMLText(final String html, final String text) {
-        setHTMLText(html, null, text);
+    private void clear() {
+        setPrimaryClipNoException(ClipData.newPlainText(null, null));
     }
 
-    @CalledByNative
-    private static boolean isHTMLClipboardSupported() {
-        return ApiCompatibilityUtils.isHTMLClipboardSupported();
-    }
-
-    private void setPrimaryClipNoException(ClipData clip) {
+    public void setPrimaryClipNoException(ClipData clip) {
         try {
             mClipboardManager.setPrimaryClip(clip);
         } catch (Exception ex) {
@@ -162,4 +176,19 @@ public class Clipboard {
             Toast.makeText(mContext, text, Toast.LENGTH_SHORT).show();
         }
     }
+
+    /**
+     * Tells the C++ Clipboard that the clipboard has changed.
+     *
+     * Implements OnPrimaryClipChangedListener to listen for clipboard updates.
+     */
+    @Override
+    public void onPrimaryClipChanged() {
+        RecordUserAction.record("MobileClipboardChanged");
+        long nativeClipboardAndroid = nativeInit();
+        if (nativeClipboardAndroid != 0) nativeOnPrimaryClipChanged(nativeClipboardAndroid);
+    }
+
+    private native long nativeInit();
+    private native void nativeOnPrimaryClipChanged(long nativeClipboardAndroid);
 }

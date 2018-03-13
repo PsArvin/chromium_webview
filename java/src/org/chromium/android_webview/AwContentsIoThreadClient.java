@@ -4,8 +4,8 @@
 
 package org.chromium.android_webview;
 
-import org.chromium.base.CalledByNative;
-import org.chromium.base.JNINamespace;
+import org.chromium.base.annotations.CalledByNative;
+import org.chromium.base.annotations.JNINamespace;
 
 /**
  * Delegate for handling callbacks. All methods are called on the IO thread.
@@ -14,29 +14,25 @@ import org.chromium.base.JNINamespace;
  * provided functionality.
  */
 @JNINamespace("android_webview")
-public interface AwContentsIoThreadClient {
+public abstract class AwContentsIoThreadClient {
     @CalledByNative
-    public int getCacheMode();
+    public abstract int getCacheMode();
 
     @CalledByNative
-    public InterceptedRequestData shouldInterceptRequest(String url, boolean isMainFrame);
+    public abstract boolean shouldBlockContentUrls();
 
     @CalledByNative
-    public boolean shouldBlockContentUrls();
+    public abstract boolean shouldBlockFileUrls();
 
     @CalledByNative
-    public boolean shouldBlockFileUrls();
+    public abstract boolean shouldBlockNetworkLoads();
 
     @CalledByNative
-    public boolean shouldBlockNetworkLoads();
+    public abstract boolean shouldAcceptThirdPartyCookies();
 
     @CalledByNative
-    public void onDownloadStart(String url,
-                                String userAgent,
-                                String contentDisposition,
-                                String mimeType,
-                                long contentLength);
+    public abstract boolean getSafeBrowsingEnabled();
 
     @CalledByNative
-    public void newLoginRequest(String realm, String account, String args);
+    public abstract AwContentsBackgroundThreadClient getBackgroundThreadClient();
 }

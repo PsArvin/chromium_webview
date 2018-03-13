@@ -4,6 +4,7 @@
 
 package org.chromium.content.browser;
 
+import android.annotation.SuppressLint;
 import android.content.Context;
 import android.content.Intent;
 import android.content.pm.ApplicationInfo;
@@ -13,7 +14,8 @@ import android.content.pm.PackageManager.NameNotFoundException;
 import android.content.pm.ResolveInfo;
 import android.content.pm.ServiceInfo;
 import android.os.Bundle;
-import android.util.Log;
+
+import org.chromium.base.Log;
 
 import java.util.List;
 
@@ -23,7 +25,7 @@ import java.util.List;
  */
 public class PepperPluginManager {
 
-    private static final String LOGTAG = "PepperPluginManager";
+    private static final String TAG = "cr.PepperPluginManager";
 
     /**
      * Service Action: A plugin wishes to be loaded in the ContentView must
@@ -54,7 +56,7 @@ public class PepperPluginManager {
         // Assemble the plugin info, according to the format described in
         // pepper_plugin_list.cc.
         // (eg. path<#name><#description><#version>;mimetype)
-        StringBuffer plugin = new StringBuffer(PEPPER_PLUGIN_ROOT);
+        StringBuilder plugin = new StringBuilder(PEPPER_PLUGIN_ROOT);
         plugin.append(filename);
 
         // Find the (optional) name/description/version of the plugin.
@@ -87,8 +89,10 @@ public class PepperPluginManager {
      * @param context Android context
      * @return        Description string for plugins
      */
+    // TODO(crbug.com/635567): Fix this properly.
+    @SuppressLint("WrongConstant")
     public static String getPlugins(final Context context) {
-        StringBuffer ret = new StringBuffer();
+        StringBuilder ret = new StringBuilder();
         PackageManager pm = context.getPackageManager();
         List<ResolveInfo> plugins = pm.queryIntentServices(
                 new Intent(PEPPER_PLUGIN_ACTION),
@@ -96,9 +100,9 @@ public class PepperPluginManager {
         for (ResolveInfo info : plugins) {
             // Retrieve the plugin's service information.
             ServiceInfo serviceInfo = info.serviceInfo;
-            if (serviceInfo == null || serviceInfo.metaData == null ||
-                    serviceInfo.packageName == null) {
-                Log.e(LOGTAG, "Can't get service information from " + info);
+            if (serviceInfo == null || serviceInfo.metaData == null
+                    || serviceInfo.packageName == null) {
+                Log.e(TAG, "Can't get service information from %s", info);
                 continue;
             }
 
@@ -107,14 +111,14 @@ public class PepperPluginManager {
             try {
                 pkgInfo = pm.getPackageInfo(serviceInfo.packageName, 0);
             } catch (NameNotFoundException e) {
-                Log.e(LOGTAG, "Can't find plugin: " + serviceInfo.packageName);
+                Log.e(TAG, "Can't find plugin: %s", serviceInfo.packageName);
                 continue;
             }
-            if (pkgInfo == null ||
-                    (pkgInfo.applicationInfo.flags & ApplicationInfo.FLAG_SYSTEM) == 0) {
+            if (pkgInfo == null
+                    || (pkgInfo.applicationInfo.flags & ApplicationInfo.FLAG_SYSTEM) == 0) {
                 continue;
             }
-            Log.i(LOGTAG, "The given plugin package is preloaded: " + serviceInfo.packageName);
+            Log.i(TAG, "The given plugin package is preloaded: %s", serviceInfo.packageName);
 
             String plugin = getPluginDescription(serviceInfo.metaData);
             if (plugin == null) {

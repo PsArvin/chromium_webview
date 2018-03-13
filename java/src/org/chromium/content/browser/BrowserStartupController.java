@@ -6,14 +6,17 @@ package org.chromium.content.browser;
 
 import android.content.Context;
 import android.os.Handler;
-import android.util.Log;
+import android.os.StrictMode;
 
-import com.google.common.annotations.VisibleForTesting;
-
-import org.chromium.base.CalledByNative;
-import org.chromium.base.JNINamespace;
+import org.chromium.base.ContextUtils;
+import org.chromium.base.Log;
+import org.chromium.base.ResourceExtractor;
 import org.chromium.base.ThreadUtils;
+import org.chromium.base.VisibleForTesting;
+import org.chromium.base.annotations.CalledByNative;
+import org.chromium.base.annotations.JNINamespace;
 import org.chromium.base.library_loader.LibraryLoader;
+import org.chromium.base.library_loader.LibraryProcessType;
 import org.chromium.base.library_loader.LoaderErrors;
 import org.chromium.base.library_loader.ProcessInitException;
 import org.chromium.content.app.ContentMain;
@@ -45,7 +48,7 @@ public class BrowserStartupController {
         void onFailure();
     }
 
-    private static final String TAG = "BrowserStartupController";
+    private static final String TAG = "cr.BrowserStartup";
 
     // Helper constants for {@link StartupCallback#onSuccess}.
     private static final boolean ALREADY_STARTED = true;
@@ -59,16 +62,10 @@ public class BrowserStartupController {
 
     private static BrowserStartupController sInstance;
 
-    private static boolean sBrowserMayStartAsynchronously = false;
+    private static boolean sShouldStartGpuProcessOnBrowserStartup;
 
-    private static void setAsynchronousStartup(boolean enable) {
-        sBrowserMayStartAsynchronously = enable;
-    }
-
-    @VisibleForTesting
-    @CalledByNative
-    static boolean browserMayStartAsynchonously() {
-        return sBrowserMayStartAsynchronously;
+    private static void setShouldStartGpuProcessOnBrowserStartup(boolean enable) {
+        sShouldStartGpuProcessOnBrowserStartup = enable;
     }
 
     @VisibleForTesting
@@ -79,59 +76,83 @@ public class BrowserStartupController {
         }
     }
 
+    @CalledByNative
+    static boolean shouldStartGpuProcessOnBrowserStartup() {
+        return sShouldStartGpuProcessOnBrowserStartup;
+    }
+
     // A list of callbacks that should be called when the async startup of the browser process is
     // complete.
     private final List<StartupCallback> mAsyncStartupCallbacks;
 
-    // The context is set on creation, but the reference is cleared after the browser process
-    // initialization has been started, since it is not needed anymore. This is to ensure the
-    // context is not leaked.
-    private final Context mContext;
-
     // Whether the async startup of the browser process has started.
     private boolean mHasStartedInitializingBrowserProcess;
 
+    // Whether tasks that occur after resource extraction have been completed.
+    private boolean mPostResourceExtractionTasksCompleted;
+
+    private boolean mHasCalledContentStart;
+
     // Whether the async startup of the browser process is complete.
     private boolean mStartupDone;
-
-    // Use single-process mode that runs the renderer on a separate thread in
-    // the main application.
-    public static final int MAX_RENDERERS_SINGLE_PROCESS = 0;
-
-    // Cap on the maximum number of renderer processes that can be requested.
-    // This is currently set to account for:
-    //  13: The maximum number of sandboxed processes we have available
-    // - 1: The regular New Tab Page
-    // - 1: The incognito New Tab Page
-    // - 1: A regular incognito tab
-    // - 1: Safety buffer (http://crbug.com/251279)
-    public static final int MAX_RENDERERS_LIMIT =
-            ChildProcessLauncher.MAX_REGISTERED_SANDBOXED_SERVICES - 4;
 
     // This field is set after startup has been completed based on whether the startup was a success
     // or not. It is used when later requests to startup come in that happen after the initial set
     // of enqueued callbacks have been executed.
     private boolean mStartupSuccess;
 
-    BrowserStartupController(Context context) {
-        mContext = context;
-        mAsyncStartupCallbacks = new ArrayList<StartupCallback>();
+    private int mLibraryProcessType;
+
+    private TracingControllerAndroid mTracingController;
+
+    BrowserStartupController(int libraryProcessType) {
+        mAsyncStartupCallbacks = new ArrayList<>();
+        mLibraryProcessType = libraryProcessType;
+        ThreadUtils.postOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+                addStartupCompletedObserver(new StartupCallback() {
+                    @Override
+                    public void onSuccess(boolean alreadyStarted) {
+                        assert mTracingController == null;
+                        Context context = ContextUtils.getApplicationContext();
+                        mTracingController = new TracingControllerAndroid(context);
+                        mTracingController.registerReceiver(context);
+                    }
+
+                    @Override
+                    public void onFailure() {
+                        // Startup failed.
+                    }
+                });
+            }
+        });
     }
 
-    public static BrowserStartupController get(Context context) {
+    /**
+     * Get BrowserStartupController instance, create a new one if no existing.
+     *
+     * @param libraryProcessType the type of process the shared library is loaded. it must be
+     *                           LibraryProcessType.PROCESS_BROWSER or
+     *                           LibraryProcessType.PROCESS_WEBVIEW.
+     * @return BrowserStartupController instance.
+     */
+    public static BrowserStartupController get(int libraryProcessType) {
         assert ThreadUtils.runningOnUiThread() : "Tried to start the browser on the wrong thread.";
         ThreadUtils.assertOnUiThread();
         if (sInstance == null) {
-            sInstance = new BrowserStartupController(context.getApplicationContext());
+            assert LibraryProcessType.PROCESS_BROWSER == libraryProcessType
+                    || LibraryProcessType.PROCESS_WEBVIEW == libraryProcessType;
+            sInstance = new BrowserStartupController(libraryProcessType);
         }
+        assert sInstance.mLibraryProcessType == libraryProcessType : "Wrong process type";
         return sInstance;
     }
 
     @VisibleForTesting
-    static BrowserStartupController overrideInstanceForTest(BrowserStartupController controller) {
-        if (sInstance == null) {
-            sInstance = controller;
-        }
+    public static BrowserStartupController overrideInstanceForTest(
+            BrowserStartupController controller) {
+        sInstance = controller;
         return sInstance;
     }
 
@@ -141,9 +162,10 @@ public class BrowserStartupController {
      * <p/>
      * Note that this can only be called on the UI thread.
      *
+     * @param startGpuProcess Whether to start the GPU process if it is not started.
      * @param callback the callback to be called when browser startup is complete.
      */
-    public void startBrowserProcessesAsync(final StartupCallback callback)
+    public void startBrowserProcessesAsync(boolean startGpuProcess, final StartupCallback callback)
             throws ProcessInitException {
         assert ThreadUtils.runningOnUiThread() : "Tried to start the browser on the wrong thread.";
         if (mStartupDone) {
@@ -161,13 +183,18 @@ public class BrowserStartupController {
             // flag that indicates that we have kicked off starting the browser process.
             mHasStartedInitializingBrowserProcess = true;
 
-            prepareToStartBrowserProcess(MAX_RENDERERS_LIMIT);
-
-            setAsynchronousStartup(true);
-            if (contentStart() > 0) {
-                // Failed. The callbacks may not have run, so run them.
-                enqueueCallbackExecution(STARTUP_FAILURE, NOT_ALREADY_STARTED);
-            }
+            setShouldStartGpuProcessOnBrowserStartup(startGpuProcess);
+            prepareToStartBrowserProcess(false, new Runnable() {
+                @Override
+                public void run() {
+                    ThreadUtils.assertOnUiThread();
+                    if (mHasCalledContentStart) return;
+                    if (contentStart() > 0) {
+                        // Failed. The callbacks may not have run, so run them.
+                        enqueueCallbackExecution(STARTUP_FAILURE, NOT_ALREADY_STARTED);
+                    }
+                }
+            });
         }
     }
 
@@ -178,21 +205,27 @@ public class BrowserStartupController {
      * <p/>
      * Note that this can only be called on the UI thread.
      *
-     * @param maxRenderers The maximum number of renderer processes the browser may
-     *                      create. Zero for single process mode.
+     * @param singleProcess true iff the browser should run single-process, ie. keep renderers in
+     *                      the browser process
      * @throws ProcessInitException
      */
-    public void startBrowserProcessesSync(int maxRenderers) throws ProcessInitException {
+    public void startBrowserProcessesSync(boolean singleProcess) throws ProcessInitException {
         // If already started skip to checking the result
         if (!mStartupDone) {
-            if (!mHasStartedInitializingBrowserProcess) {
-                prepareToStartBrowserProcess(maxRenderers);
+            if (!mHasStartedInitializingBrowserProcess || !mPostResourceExtractionTasksCompleted) {
+                prepareToStartBrowserProcess(singleProcess, null);
             }
 
-            setAsynchronousStartup(false);
-            if (contentStart() > 0) {
-                // Failed. The callbacks may not have run, so run them.
-                enqueueCallbackExecution(STARTUP_FAILURE, NOT_ALREADY_STARTED);
+            boolean startedSuccessfully = true;
+            if (!mHasCalledContentStart) {
+                if (contentStart() > 0) {
+                    // Failed. The callbacks may not have run, so run them.
+                    enqueueCallbackExecution(STARTUP_FAILURE, NOT_ALREADY_STARTED);
+                    startedSuccessfully = false;
+                }
+            }
+            if (startedSuccessfully) {
+                flushStartupTasks();
             }
         }
 
@@ -208,7 +241,22 @@ public class BrowserStartupController {
      */
     @VisibleForTesting
     int contentStart() {
+        assert !mHasCalledContentStart;
+        mHasCalledContentStart = true;
         return ContentMain.start();
+    }
+
+    @VisibleForTesting
+    void flushStartupTasks() {
+        nativeFlushStartupTasks();
+    }
+
+    /**
+     * @return Whether the browser process completed successfully.
+     */
+    public boolean isStartupSuccessfullyCompleted() {
+        ThreadUtils.assertOnUiThread();
+        return mStartupDone && mStartupSuccess;
     }
 
     public void addStartupCompletedObserver(StartupCallback callback) {
@@ -260,54 +308,73 @@ public class BrowserStartupController {
     }
 
     @VisibleForTesting
-    void prepareToStartBrowserProcess(int maxRendererProcesses) throws ProcessInitException {
-        Log.i(TAG, "Initializing chromium process, renderers=" + maxRendererProcesses);
+    void prepareToStartBrowserProcess(
+            final boolean singleProcess, final Runnable completionCallback)
+                    throws ProcessInitException {
+        Log.i(TAG, "Initializing chromium process, singleProcess=%b", singleProcess);
 
-        // Normally Main.java will have kicked this off asynchronously for Chrome. But other
-        // ContentView apps like tests also need them so we make sure we've extracted resources
-        // here. We can still make it a little async (wait until the library is loaded).
-        ResourceExtractor resourceExtractor = ResourceExtractor.get(mContext);
-        resourceExtractor.startExtractingResources();
+        // This strictmode exception is to cover the case where the browser process is being started
+        // asynchronously but not in the main browser flow.  The main browser flow will trigger
+        // library loading earlier and this will be a no-op, but in the other cases this will need
+        // to block on loading libraries.
+        // This applies to tests and ManageSpaceActivity, which can be launched from Settings.
+        StrictMode.ThreadPolicy oldPolicy = StrictMode.allowThreadDiskReads();
+        try {
+            // Normally Main.java will have already loaded the library asynchronously, we only need
+            // to load it here if we arrived via another flow, e.g. bookmark access & sync setup.
+            LibraryLoader.get(mLibraryProcessType).ensureInitialized();
+        } finally {
+            StrictMode.setThreadPolicy(oldPolicy);
+        }
 
-        // Normally Main.java will have already loaded the library asynchronously, we only need
-        // to load it here if we arrived via another flow, e.g. bookmark access & sync setup.
-        LibraryLoader.ensureInitialized(mContext);
+        Runnable postResourceExtraction = new Runnable() {
+            @Override
+            public void run() {
+                if (!mPostResourceExtractionTasksCompleted) {
+                    // TODO(yfriedman): Remove dependency on a command line flag for this.
+                    DeviceUtils.addDeviceSpecificUserAgentSwitch(
+                            ContextUtils.getApplicationContext());
+                    nativeSetCommandLineFlags(
+                            singleProcess, nativeIsPluginEnabled() ? getPlugins() : null);
+                    mPostResourceExtractionTasksCompleted = true;
+                }
 
-        // TODO(yfriedman): Remove dependency on a command line flag for this.
-        DeviceUtils.addDeviceSpecificUserAgentSwitch(mContext);
+                if (completionCallback != null) completionCallback.run();
+            }
+        };
 
-        Context appContext = mContext.getApplicationContext();
-        // Now we really need to have the resources ready.
-        resourceExtractor.waitForCompletion();
-
-        nativeSetCommandLineFlags(maxRendererProcesses,
-                nativeIsPluginEnabled() ? getPlugins() : null);
-        ContentMain.initApplicationContext(appContext);
+        if (completionCallback == null) {
+            // If no continuation callback is specified, then force the resource extraction
+            // to complete.
+            ResourceExtractor.get().waitForCompletion();
+            postResourceExtraction.run();
+        } else {
+            ResourceExtractor.get().addCompletionCallback(postResourceExtraction);
+        }
     }
 
     /**
      * Initialization needed for tests. Mainly used by content browsertests.
      */
     public void initChromiumBrowserProcessForTests() {
-        ResourceExtractor resourceExtractor = ResourceExtractor.get(mContext);
+        ResourceExtractor resourceExtractor = ResourceExtractor.get();
         resourceExtractor.startExtractingResources();
         resourceExtractor.waitForCompletion();
-
-        // Having a single renderer should be sufficient for tests. We can't have more than
-        // MAX_RENDERERS_LIMIT.
-        nativeSetCommandLineFlags(1 /* maxRenderers */, null);
+        nativeSetCommandLineFlags(false, null);
     }
 
     private String getPlugins() {
-        return PepperPluginManager.getPlugins(mContext);
+        return PepperPluginManager.getPlugins(ContextUtils.getApplicationContext());
     }
 
-    private static native void nativeSetCommandLineFlags(int maxRenderProcesses,
-            String pluginDescriptor);
+    private static native void nativeSetCommandLineFlags(
+            boolean singleProcess, String pluginDescriptor);
 
     // Is this an official build of Chrome? Only native code knows for sure. Official build
     // knowledge is needed very early in process startup.
     private static native boolean nativeIsOfficialBuild();
 
     private static native boolean nativeIsPluginEnabled();
+
+    private static native void nativeFlushStartupTasks();
 }

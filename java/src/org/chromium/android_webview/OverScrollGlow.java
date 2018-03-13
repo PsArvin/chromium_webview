@@ -23,13 +23,18 @@ class OverScrollGlow {
     private int mOverScrollDeltaX;
     private int mOverScrollDeltaY;
 
-    public OverScrollGlow(View host) {
+    private boolean mShouldPull;
+
+    public OverScrollGlow(Context context, View host) {
         mHostView = host;
-        Context context = host.getContext();
         mEdgeGlowTop = new EdgeEffect(context);
         mEdgeGlowBottom = new EdgeEffect(context);
         mEdgeGlowLeft = new EdgeEffect(context);
         mEdgeGlowRight = new EdgeEffect(context);
+    }
+
+    public void setShouldPull(boolean shouldPull) {
+        mShouldPull = shouldPull;
     }
 
     /**
@@ -43,6 +48,7 @@ class OverScrollGlow {
      * @param maxY Maximum range for vertical scrolling
      */
     public void pullGlow(int x, int y, int oldX, int oldY, int maxX, int maxY) {
+        if (!mShouldPull) return;
         // Only show overscroll bars if there was no movement in any direction
         // as a result of scrolling.
         if (oldX == mHostView.getScrollX() && oldY == mHostView.getScrollY()) {
@@ -95,6 +101,12 @@ class OverScrollGlow {
      */
     public void absorbGlow(int x, int y, int oldX, int oldY, int rangeX, int rangeY,
             float currentFlingVelocity) {
+        if (mShouldPull) {
+            // Not absorb the glow because the user is pulling the glow now.
+            // TODO(hush): crbug.com/501556. Do not use "mShouldPull" to switch
+            // between absorbGlow and pullGlow. Use the velocity instead.
+            return;
+        }
         if (rangeY > 0 || mHostView.getOverScrollMode() == View.OVER_SCROLL_ALWAYS) {
             if (y < 0 && oldY >= 0) {
                 mEdgeGlowTop.onAbsorb((int) currentFlingVelocity);
@@ -192,8 +204,8 @@ class OverScrollGlow {
      * @return True if any glow is still animating
      */
     public boolean isAnimating() {
-        return (!mEdgeGlowTop.isFinished() || !mEdgeGlowBottom.isFinished() ||
-                !mEdgeGlowLeft.isFinished() || !mEdgeGlowRight.isFinished());
+        return (!mEdgeGlowTop.isFinished() || !mEdgeGlowBottom.isFinished()
+                || !mEdgeGlowLeft.isFinished() || !mEdgeGlowRight.isFinished());
     }
 
     /**

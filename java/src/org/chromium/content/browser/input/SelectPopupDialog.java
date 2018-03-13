@@ -10,63 +10,62 @@ import android.content.DialogInterface;
 import android.content.res.TypedArray;
 import android.util.SparseBooleanArray;
 import android.view.View;
+import android.view.WindowManager;
 import android.widget.AdapterView;
 import android.widget.AdapterView.OnItemClickListener;
 import android.widget.ListView;
 
 import org.chromium.content.R;
-import org.chromium.content.browser.ContentViewCore;
 
 import java.util.List;
 
 /**
  * Handles the popup dialog for the <select> HTML tag support.
  */
-public class SelectPopupDialog {
-    // The currently showing popup dialog, null if none is showing.
-    private static SelectPopupDialog sShownDialog;
-
+public class SelectPopupDialog implements SelectPopup.Ui {
     private static final int[] SELECT_DIALOG_ATTRS = {
         R.attr.select_dialog_multichoice,
         R.attr.select_dialog_singlechoice
     };
 
     // The dialog hosting the popup list view.
-    private AlertDialog mListBoxPopup = null;
+    private final AlertDialog mListBoxPopup;
+    private final SelectPopup mSelectPopup;
 
-    private final ContentViewCore mContentViewCore;
-    private final Context mContext;
+    private boolean mSelectionNotified;
 
-    private SelectPopupDialog(ContentViewCore contentViewCore, List<SelectPopupItem> items,
-            boolean multiple, int[] selected) {
-        mContentViewCore = contentViewCore;
-        mContext = mContentViewCore.getContext();
+    public SelectPopupDialog(SelectPopup selectPopup, Context windowContext,
+            List<SelectPopupItem> items, boolean multiple, int[] selected) {
+        mSelectPopup = selectPopup;
 
-        final ListView listView = new ListView(mContext);
+        final ListView listView = new ListView(windowContext);
+        // setCacheColorHint(0) is required to prevent a black background in WebView on Lollipop:
+        // crbug.com/653026
         listView.setCacheColorHint(0);
-        AlertDialog.Builder b = new AlertDialog.Builder(mContext)
+
+        AlertDialog.Builder b = new AlertDialog.Builder(windowContext)
                 .setView(listView)
-                .setCancelable(true)
-                .setInverseBackgroundForced(true);
+                .setCancelable(true);
+        setInverseBackgroundForced(b);
 
         if (multiple) {
             b.setPositiveButton(android.R.string.ok, new DialogInterface.OnClickListener() {
                 @Override
                 public void onClick(DialogInterface dialog, int which) {
-                    mContentViewCore.selectPopupMenuItems(getSelectedIndices(listView));
+                    notifySelection(getSelectedIndices(listView));
                 }
             });
             b.setNegativeButton(android.R.string.cancel,
                     new DialogInterface.OnClickListener() {
                         @Override
                         public void onClick(DialogInterface dialog, int which) {
-                            mContentViewCore.selectPopupMenuItems(null);
+                            notifySelection(null);
                         }
                     });
         }
         mListBoxPopup = b.create();
         final SelectPopupAdapter adapter = new SelectPopupAdapter(
-                mContext, getSelectDialogLayout(multiple), items);
+                mListBoxPopup.getContext(), getSelectDialogLayout(multiple), items);
         listView.setAdapter(adapter);
         listView.setFocusableInTouchMode(true);
 
@@ -81,7 +80,7 @@ public class SelectPopupDialog {
                 @Override
                 public void onItemClick(AdapterView<?> parent, View v,
                         int position, long id) {
-                    mContentViewCore.selectPopupMenuItems(getSelectedIndices(listView));
+                    notifySelection(getSelectedIndices(listView));
                     mListBoxPopup.dismiss();
                 }
             });
@@ -93,28 +92,29 @@ public class SelectPopupDialog {
         mListBoxPopup.setOnCancelListener(new DialogInterface.OnCancelListener() {
             @Override
             public void onCancel(DialogInterface dialog) {
-                mContentViewCore.selectPopupMenuItems(null);
-            }
-        });
-        mListBoxPopup.setOnDismissListener(new DialogInterface.OnDismissListener() {
-            @Override
-            public void onDismiss(DialogInterface dialog) {
-                mListBoxPopup = null;
-                sShownDialog = null;
+                notifySelection(null);
             }
         });
     }
 
+    @SuppressWarnings("deprecation")
+    private static void setInverseBackgroundForced(AlertDialog.Builder builder) {
+        // This is needed for pre-Holo themes (e.g. android:Theme.Black), which can be used in
+        // WebView. See http://crbug.com/596626. This can be removed if/when this class starts
+        // using android.support.v7.app.AlertDialog.
+        builder.setInverseBackgroundForced(true);
+    }
+
     private int getSelectDialogLayout(boolean isMultiChoice) {
         int resourceId;
-        TypedArray styledAttributes = mContext.obtainStyledAttributes(
+        TypedArray styledAttributes = mListBoxPopup.getContext().obtainStyledAttributes(
                 R.style.SelectPopupDialog, SELECT_DIALOG_ATTRS);
         resourceId = styledAttributes.getResourceId(isMultiChoice ? 0 : 1, 0);
         styledAttributes.recycle();
         return resourceId;
     }
 
-    private int[] getSelectedIndices(ListView listView) {
+    private static int[] getSelectedIndices(ListView listView) {
         SparseBooleanArray sparseArray = listView.getCheckedItemPositions();
         int selectedCount = 0;
         for (int i = 0; i < sparseArray.size(); ++i) {
@@ -131,38 +131,29 @@ public class SelectPopupDialog {
         return indices;
     }
 
-    /**
-     * Shows the popup menu triggered by the passed ContentView.
-     * Hides any currently shown popup.
-     * @param items           Items to show.
-     * @param multiple        Whether the popup menu should support multi-select.
-     * @param selectedIndices Indices of selected items.
-     */
-    public static void show(ContentViewCore contentViewCore, List<SelectPopupItem> items,
-            boolean multiple, int[] selectedIndices) {
-        // Hide the popup currently showing if any.  This could happen if the user pressed a select
-        // and pressed it again before the popup was shown.  In that case, the previous popup is
-        // irrelevant and can be hidden.
-        hide(null);
-        sShownDialog = new SelectPopupDialog(contentViewCore, items, multiple, selectedIndices);
-        sShownDialog.mListBoxPopup.show();
+    private void notifySelection(int[] indicies) {
+        if (mSelectionNotified) return;
+        mSelectPopup.selectMenuItems(indicies);
+        mSelectionNotified = true;
     }
 
-    /**
-     * Hides the showing popup menu if any it was triggered by the passed ContentView. If
-     * contentView is null, hides it regardless of which ContentView triggered it.
-     * @param contentView
-     */
-    public static void hide(ContentViewCore contentView) {
-        if (sShownDialog != null &&
-                (contentView == null || sShownDialog.mContentViewCore == contentView)) {
-            if (contentView != null) contentView.selectPopupMenuItems(null);
-            sShownDialog.mListBoxPopup.dismiss();
+    @Override
+    public void show() {
+        try {
+            mListBoxPopup.show();
+        } catch (WindowManager.BadTokenException e) {
+            notifySelection(null);
         }
     }
 
-    // The methods below are used by tests.
-    public static SelectPopupDialog getCurrent() {
-        return sShownDialog;
+    @Override
+    public void hide(boolean sendsCancelMessage) {
+        if (sendsCancelMessage) {
+            mListBoxPopup.cancel();
+            notifySelection(null);
+        } else {
+            mSelectionNotified = true;
+            mListBoxPopup.cancel();
+        }
     }
 }

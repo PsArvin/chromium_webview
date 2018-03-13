@@ -1,4 +1,4 @@
-// Copyright (c) 2012 The Chromium Authors. All rights reserved.
+// Copyright 2012 The Chromium Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
@@ -6,16 +6,17 @@ package org.chromium.components.web_contents_delegate_android;
 
 import android.view.KeyEvent;
 
-import org.chromium.base.CalledByNative;
-import org.chromium.base.JNINamespace;
-import org.chromium.content.browser.ContentViewCore;
+import org.chromium.base.annotations.CalledByNative;
+import org.chromium.base.annotations.JNINamespace;
+import org.chromium.content.browser.ContentVideoViewEmbedder;
+import org.chromium.content_public.browser.WebContents;
+import org.chromium.content_public.common.ResourceRequestBody;
 
 /**
  * Java peer of the native class of the same name.
  */
 @JNINamespace("web_contents_delegate_android")
 public class WebContentsDelegateAndroid {
-
     // Equivalent of WebCore::WebConsoleMessage::LevelTip.
     public static final int LOG_LEVEL_TIP = 0;
     // Equivalent of WebCore::WebConsoleMessage::LevelLog.
@@ -24,19 +25,6 @@ public class WebContentsDelegateAndroid {
     public static final int LOG_LEVEL_WARNING = 2;
     // Equivalent of WebCore::WebConsoleMessage::LevelError.
     public static final int LOG_LEVEL_ERROR = 3;
-
-    // Flags passed to the WebContentsDelegateAndroid.navigationStateChanged to tell it
-    // what has changed. Should match the values in invalidate_type.h.
-    // Equivalent of InvalidateTypes::INVALIDATE_TYPE_URL.
-    public static final int INVALIDATE_TYPE_URL = 1 << 0;
-    // Equivalent of InvalidateTypes::INVALIDATE_TYPE_TAB.
-    public static final int INVALIDATE_TYPE_TAB = 1 << 1;
-    // Equivalent of InvalidateTypes::INVALIDATE_TYPE_LOAD.
-    public static final int INVALIDATE_TYPE_LOAD = 1 << 2;
-    // Equivalent of InvalidateTypes::INVALIDATE_TYPE_PAGE_ACTIONS.
-    public static final int INVALIDATE_TYPE_PAGE_ACTIONS = 1 << 3;
-    // Equivalent of InvalidateTypes::INVALIDATE_TYPE_TITLE.
-    public static final int INVALIDATE_TYPE_TITLE = 1 << 4;
 
     // The most recent load progress callback received from WebContents, as a percentage.
     // Initialize to 100 to indicate that we're not in a loading state.
@@ -47,33 +35,28 @@ public class WebContentsDelegateAndroid {
     }
 
     /**
-     * @param disposition The new tab disposition as per the constants in
-     *                    org.chromium.ui.WindowOpenDisposition (See window_open_disposition_list.h
-     *                    for the enumeration definitions).
+     * @param disposition         The new tab disposition, defined in
+     *                            //ui/base/mojo/window_open_disposition.mojom.
+     * @param isRendererInitiated Whether or not the renderer initiated this action.
      */
     @CalledByNative
-    public void openNewTab(String url, String extraHeaders, byte[] postData, int disposition) {
-    }
+    public void openNewTab(String url, String extraHeaders, ResourceRequestBody postData,
+            int disposition, boolean isRendererInitiated) {}
 
     @CalledByNative
-    public void activateContents() {
-    }
+    public void activateContents() {}
 
     @CalledByNative
-    public void closeContents() {
-    }
+    public void closeContents() {}
 
     @CalledByNative
-    public void onLoadStarted() {
-    }
+    public void loadingStateChanged(boolean toDifferentDocument) {}
 
     @CalledByNative
-    public void onLoadStopped() {
-    }
+    public void navigationStateChanged(int flags) {}
 
     @CalledByNative
-    public void navigationStateChanged(int flags) {
-    }
+    public void visibleSSLStateChanged() {}
 
     @SuppressWarnings("unused")
     @CalledByNative
@@ -85,26 +68,32 @@ public class WebContentsDelegateAndroid {
     /**
      * @param progress The load progress [0, 100] for the current web contents.
      */
-    public void onLoadProgressChanged(int progress) {
-    }
+    public void onLoadProgressChanged(int progress) {}
 
     /**
      * Signaled when the renderer has been deemed to be unresponsive.
      */
     @CalledByNative
-    public void rendererUnresponsive() {
-    }
+    public void rendererUnresponsive() {}
 
     /**
      * Signaled when the render has been deemed to be responsive.
      */
     @CalledByNative
-    public void rendererResponsive() {
+    public void rendererResponsive() {}
+
+    @CalledByNative
+    public void webContentsCreated(WebContents sourceWebContents, long openerRenderProcessId,
+            long openerRenderFrameId, String frameName, String targetUrl,
+            WebContents newWebContents) {}
+
+    @CalledByNative
+    public boolean shouldCreateWebContents(String targetUrl) {
+        return true;
     }
 
     @CalledByNative
-    public void onUpdateUrl(String url) {
-    }
+    public void onUpdateUrl(String url) {}
 
     @CalledByNative
     public boolean takeFocus(boolean reverse) {
@@ -127,25 +116,62 @@ public class WebContentsDelegateAndroid {
      * @return true if the client will handle logging the message.
      */
     @CalledByNative
-    public boolean addMessageToConsole(int level, String message, int lineNumber,
-            String sourceId) {
+    public boolean addMessageToConsole(int level, String message, int lineNumber, String sourceId) {
         return false;
     }
 
     /**
      * Report a form resubmission. The overwriter of this function should eventually call
-     * either of ContentViewCore.ContinuePendingReload or ContentViewCore.CancelPendingReload.
+     * either of NavigationController.ContinuePendingReload or
+     * NavigationController.CancelPendingReload.
      */
     @CalledByNative
-    public void showRepostFormWarningDialog(ContentViewCore contentViewCore) {
-    }
+    public void showRepostFormWarningDialog() {}
 
     @CalledByNative
-    public void toggleFullscreenModeForTab(boolean enterFullscreen) {
-    }
+    public void toggleFullscreenModeForTab(boolean enterFullscreen) {}
 
     @CalledByNative
     public boolean isFullscreenForTabOrPending() {
+        return false;
+    }
+
+    @CalledByNative
+    public ContentVideoViewEmbedder getContentVideoViewEmbedder() {
+        return null;
+    }
+
+    /**
+     * Called when BrowserMediaPlayerManager wants to load a media resource.
+     * @param url the URL of media resource to load.
+     * @return true to prevent the resource from being loaded.
+     */
+    @CalledByNative
+    public boolean shouldBlockMediaRequest(String url) {
+        return false;
+    }
+
+    /**
+     * @return The height of the top controls in DIP.
+     */
+    @CalledByNative
+    public int getTopControlsHeight() {
+        return 0;
+    }
+
+    /**
+     * @return The height of the bottom controls in DIP.
+     */
+    @CalledByNative
+    public int getBottomControlsHeight() {
+        return 0;
+    }
+
+    /**
+     * @return Whether or not the browser controls resize Blink's view size.
+     */
+    @CalledByNative
+    public boolean controlsResizeView() {
         return false;
     }
 }

@@ -24,57 +24,70 @@ public abstract class ContentSwitches {
     // Whether Chromium should use a mobile user agent.
     public static final String USE_MOBILE_UA = "use-mobile-user-agent";
 
-    // tablet specific UI components.
-    // Native switch - chrome_switches::kTabletUI
-    public static final String TABLET_UI = "tablet-ui";
-
     // Change the url of the JavaScript that gets injected when accessibility mode is enabled.
     public static final String ACCESSIBILITY_JAVASCRIPT_URL = "accessibility-js-url";
-
-    // Whether to ignore signature mismatches when connecting to BrailleBack's
-    // SelfBrailleService.
-    public static final String ACCESSIBILITY_DEBUG_BRAILLE_SERVICE = "debug-braille-service";
-
-    // Whether to always expose web content using Android's accessibility
-    // framework instead of injecting javascript for accessibility.
-    public static final String DISABLE_ACCESSIBILITY_SCRIPT_INJECTION =
-            "disable-accessibility-script-injection";
 
     // Sets the ISO country code that will be used for phone number detection.
     public static final String NETWORK_COUNTRY_ISO = "network-country-iso";
 
-    // Whether to enable the auto-hiding top controls.
-    public static final String ENABLE_TOP_CONTROLS_POSITION_CALCULATION =
-            "enable-top-controls-position-calculation";
-
-    // The height of the movable top controls.
-    public static final String TOP_CONTROLS_HEIGHT = "top-controls-height";
-
-    // How much of the top controls need to be shown before they will auto show.
+    // How much of the browser controls need to be shown before they will auto show.
     public static final String TOP_CONTROLS_SHOW_THRESHOLD = "top-controls-show-threshold";
 
-    // How much of the top controls need to be hidden before they will auto hide.
+    // How much of the browser controls need to be hidden before they will auto hide.
     public static final String TOP_CONTROLS_HIDE_THRESHOLD = "top-controls-hide-threshold";
-
-    // Native switch - chrome_switches::kEnableInstantExtendedAPI
-    public static final String ENABLE_INSTANT_EXTENDED_API = "enable-instant-extended-api";
-
-    // Native switch - content_switches::kEnableSpeechRecognition
-    public static final String ENABLE_SPEECH_RECOGNITION = "enable-speech-recognition";
-
-    // Native switch - shell_switches::kDumpRenderTree
-    public static final String DUMP_RENDER_TREE = "dump-render-tree";
 
     // Native switch - chrome_switches::kDisablePopupBlocking
     public static final String DISABLE_POPUP_BLOCKING = "disable-popup-blocking";
 
-    // Whether to disable the click delay by sending click events during double tap
-    public static final String DISABLE_CLICK_DELAY = "disable-click-delay";
+    // Native switch kDisableGestureRequirementForPresentation
+    public static final String DISABLE_GESTURE_REQUIREMENT_FOR_PRESENTATION =
+            "disable-gesture-requirement-for-presentation";
 
-    // Native switch - content_switches::kEnableOverlayFullscreenVideoSubtitle
-    public static final String ENABLE_OVERLAY_FULLSCREEN_VIDEO_SUBTITLE =
-            "enable-overlay-fullscreen-video-subtitle";
+    // Native switch kRendererProcessLimit
+    public static final String RENDER_PROCESS_LIMIT = "renderer-process-limit";
+
+    // Native switch kInProcessGPU
+    public static final String IN_PROCESS_GPU = "in-process-gpu";
+
+    // Native switch kProcessType
+    public static final String SWITCH_PROCESS_TYPE = "type";
+
+    // Native switch kRendererProcess
+    public static final String SWITCH_RENDERER_PROCESS = "renderer";
+
+    // Native switch kUtilityProcess
+    public static final String SWITCH_UTILITY_PROCESS = "utility";
+
+    // Native switch kGPUProcess
+    public static final String SWITCH_GPU_PROCESS = "gpu-process";
+
+    // Use fake device for Media Stream to replace actual camera and microphone.
+    public static final String USE_FAKE_DEVICE_FOR_MEDIA_STREAM =
+            "use-fake-device-for-media-stream";
+
+    // Native switch kHostResolverRules
+    public static final String HOST_RESOLVER_RULES = "host-resolver-rules";
+
+    // Native switch kServiceSandboxType
+    public static final String SWITCH_SERVICE_SANDBOX_TYPE = "service-sandbox-type";
+
+    // Native switch value kNetworkSandbox
+    public static final String NETWORK_SANDBOX_TYPE = "network";
 
     // Prevent instantiation.
     private ContentSwitches() {}
+
+    public static String getSwitchValue(final String[] commandLine, String switchKey) {
+        if (commandLine == null || switchKey == null) {
+            return null;
+        }
+        // This format should be matched with the one defined in command_line.h.
+        final String switchKeyPrefix = "--" + switchKey + "=";
+        for (String command : commandLine) {
+            if (command != null && command.startsWith(switchKeyPrefix)) {
+                return command.substring(switchKeyPrefix.length());
+            }
+        }
+        return null;
+    }
 }

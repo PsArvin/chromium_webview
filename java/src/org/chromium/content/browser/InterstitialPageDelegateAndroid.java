@@ -4,8 +4,9 @@
 
 package org.chromium.content.browser;
 
-import org.chromium.base.CalledByNative;
-import org.chromium.base.JNINamespace;
+import org.chromium.base.VisibleForTesting;
+import org.chromium.base.annotations.CalledByNative;
+import org.chromium.base.annotations.JNINamespace;
 
 /**
  * Allows the specification and handling of Interstitial pages in java.
@@ -20,6 +21,7 @@ public class InterstitialPageDelegateAndroid {
      *
      * @param htmlContent The HTML content for the interstitial.
      */
+    @VisibleForTesting
     public InterstitialPageDelegateAndroid(String htmlContent) {
         mNativePtr = nativeInit(htmlContent);
     }
@@ -27,6 +29,7 @@ public class InterstitialPageDelegateAndroid {
     /**
      * @return The pointer to the underlying native counterpart.
      */
+    @VisibleForTesting
     public long getNative() {
         return mNativePtr;
     }

@@ -4,15 +4,15 @@
 
 package org.chromium.base;
 
+import android.support.annotation.Nullable;
 import android.text.TextUtils;
 import android.util.Log;
 
+import org.chromium.base.annotations.MainDex;
+
 import java.io.File;
-import java.io.FileInputStream;
-import java.io.FileNotFoundException;
+import java.io.FileReader;
 import java.io.IOException;
-import java.io.InputStreamReader;
-import java.io.Reader;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
@@ -22,8 +22,9 @@ import java.util.concurrent.atomic.AtomicReference;
  * Java mirror of base/command_line.h.
  * Android applications don't have command line arguments. Instead, they're "simulated" by reading a
  * file at a specific location early during startup. Applications each define their own files, e.g.,
- * ContentShellActivity.COMMAND_LINE_FILE or ChromiumTestShellApplication.COMMAND_LINE_FILE.
+ * ContentShellApplication.COMMAND_LINE_FILE.
 **/
+@MainDex
 public abstract class CommandLine {
     // Public abstract interface, implemented in derived classes.
     // All these methods reflect their native-side counterparts.
@@ -31,6 +32,7 @@ public abstract class CommandLine {
      *  Returns true if this command line contains the given switch.
      *  (Switch names ARE case-sensitive).
      */
+    @VisibleForTesting
     public abstract boolean hasSwitch(String switchString);
 
     /**
@@ -57,6 +59,7 @@ public abstract class CommandLine {
      * this action happens before the switch is needed.
      * @param switchString the switch to add.  It should NOT start with '--' !
      */
+    @VisibleForTesting
     public abstract void appendSwitch(String switchString);
 
     /**
@@ -85,17 +88,30 @@ public abstract class CommandLine {
         return false;
     }
 
-    private static final AtomicReference<CommandLine> sCommandLine =
-        new AtomicReference<CommandLine>();
+    /**
+     * Returns the switches and arguments passed into the program, with switches and their
+     * values coming before all of the arguments.
+     */
+    protected abstract String[] getCommandLineArguments();
 
     /**
-     * @returns true if the command line has already been initialized.
+     * Destroy the command line. Called when a different instance is set.
+     * @see #setInstance
+     */
+    protected void destroy() {}
+
+    private static final AtomicReference<CommandLine> sCommandLine =
+            new AtomicReference<CommandLine>();
+
+    /**
+     * @return true if the command line has already been initialized.
      */
     public static boolean isInitialized() {
         return sCommandLine.get() != null;
     }
 
     // Equivalent to CommandLine::ForCurrentProcess in C++.
+    @VisibleForTesting
     public static CommandLine getInstance() {
         CommandLine commandLine = sCommandLine.get();
         assert commandLine != null;
@@ -107,7 +123,7 @@ public abstract class CommandLine {
      * via one of the convenience wrappers below) before using the static singleton instance.
      * @param args command line flags in 'argv' format: args[0] is the program name.
      */
-    public static void init(String[] args) {
+    public static void init(@Nullable String[] args) {
         setInstance(new JavaCommandLine(args));
     }
 
@@ -117,21 +133,20 @@ public abstract class CommandLine {
      * @param file The fully qualified command line file.
      */
     public static void initFromFile(String file) {
-        // Arbitrary clamp of 8k on the amount of file we read in.
-        char[] buffer = readUtf8FileFully(file, 8 * 1024);
-        init(buffer == null ? null : tokenizeQuotedAruments(buffer));
+        char[] buffer = readFileAsUtf8(file);
+        init(buffer == null ? null : tokenizeQuotedArguments(buffer));
     }
 
     /**
      * Resets both the java proxy and the native command lines. This allows the entire
      * command line initialization to be re-run including the call to onJniLoaded.
      */
+    @VisibleForTesting
     public static void reset() {
         setInstance(null);
     }
 
     /**
-     * Public for testing (TODO: why are the tests in a different package?)
      * Parse command line flags from a flat buffer, supporting double-quote enclosed strings
      * containing whitespace. argv elements are derived by splitting the buffer on whitepace;
      * double quote characters may enclose tokens containing whitespace; a double-quote literal
@@ -139,7 +154,14 @@ public abstract class CommandLine {
      * @param buffer A command line in command line file format as described above.
      * @return the tokenized arguments, suitable for passing to init().
      */
-    public static String[] tokenizeQuotedAruments(char[] buffer) {
+    @VisibleForTesting
+    static String[] tokenizeQuotedArguments(char[] buffer) {
+        // Just field trials can take up to 10K of command line.
+        if (buffer.length > 64 * 1024) {
+            // Check that our test runners are setting a reasonable number of flags.
+            throw new RuntimeException("Flags file too big: " + buffer.length);
+        }
+
         ArrayList<String> args = new ArrayList<String>();
         StringBuilder arg = null;
         final char noQuote = '\0';
@@ -148,8 +170,8 @@ public abstract class CommandLine {
         char currentQuote = noQuote;
         for (char c : buffer) {
             // Detect start or end of quote block.
-            if ((currentQuote == noQuote && (c == singleQuote || c == doubleQuote)) ||
-                c == currentQuote) {
+            if ((currentQuote == noQuote && (c == singleQuote || c == doubleQuote))
+                    || c == currentQuote) {
                 if (arg != null && arg.length() > 0 && arg.charAt(arg.length() - 1) == '\\') {
                     // Last char was a backslash; pop it, and treat c as a literal.
                     arg.setCharAt(arg.length() - 1, c);
@@ -184,64 +206,38 @@ public abstract class CommandLine {
         // Make a best-effort to ensure we make a clean (atomic) switch over from the old to
         // the new command line implementation. If another thread is modifying the command line
         // when this happens, all bets are off. (As per the native CommandLine).
-        sCommandLine.set(new NativeCommandLine());
+        sCommandLine.set(new NativeCommandLine(getJavaSwitchesOrNull()));
     }
 
+    @Nullable
     public static String[] getJavaSwitchesOrNull() {
         CommandLine commandLine = sCommandLine.get();
         if (commandLine != null) {
-            assert !commandLine.isNativeImplementation();
-            return ((JavaCommandLine) commandLine).getCommandLineArguments();
+            return commandLine.getCommandLineArguments();
         }
         return null;
     }
 
     private static void setInstance(CommandLine commandLine) {
         CommandLine oldCommandLine = sCommandLine.getAndSet(commandLine);
-        if (oldCommandLine != null && oldCommandLine.isNativeImplementation()) {
-            nativeReset();
+        if (oldCommandLine != null) {
+            oldCommandLine.destroy();
         }
     }
 
     /**
      * @param fileName the file to read in.
-     * @param sizeLimit cap on the file size.
-     * @return Array of chars read from the file, or null if the file cannot be read
-     *         or if its length exceeds |sizeLimit|.
+     * @return Array of chars read from the file, or null if the file cannot be read.
      */
-    private static char[] readUtf8FileFully(String fileName, int sizeLimit) {
-        Reader reader = null;
+    private static char[] readFileAsUtf8(String fileName) {
         File f = new File(fileName);
-        long fileLength = f.length();
-
-        if (fileLength == 0) {
-            return null;
-        }
-
-        if (fileLength > sizeLimit) {
-            Log.w(TAG, "File " + fileName + " length " + fileLength + " exceeds limit "
-                    + sizeLimit);
-            return null;
-        }
-
-        try {
-            char[] buffer = new char[(int) fileLength];
-            reader = new InputStreamReader(new FileInputStream(f), "UTF-8");
+        try (FileReader reader = new FileReader(f)) {
+            char[] buffer = new char[(int) f.length()];
             int charsRead = reader.read(buffer);
-            // Debug check that we've exhausted the input stream (will fail e.g. if the
-            // file grew after we inspected its length).
-            assert !reader.ready();
-            return charsRead < buffer.length ? Arrays.copyOfRange(buffer, 0, charsRead) : buffer;
-        } catch (FileNotFoundException e) {
-            return null;
+            // charsRead < f.length() in the case of multibyte characters.
+            return Arrays.copyOfRange(buffer, 0, charsRead);
         } catch (IOException e) {
-            return null;
-        } finally {
-            try {
-                if (reader != null) reader.close();
-            } catch (IOException e) {
-                Log.e(TAG, "Unable to close file reader.", e);
-            }
+            return null; // Most likely file not found.
         }
     }
 
@@ -254,7 +250,7 @@ public abstract class CommandLine {
         // The arguments begin at index 1, since index 0 contains the executable name.
         private int mArgsBegin = 1;
 
-        JavaCommandLine(String[] args) {
+        JavaCommandLine(@Nullable String[] args) {
             if (args == null || args.length == 0 || args[0] == null) {
                 mArgs.add("");
             } else {
@@ -265,11 +261,8 @@ public abstract class CommandLine {
             assert mArgs.size() > 0;
         }
 
-        /**
-         * Returns the switches and arguments passed into the program, with switches and their
-         * values coming before all of the arguments.
-         */
-        private String[] getCommandLineArguments() {
+        @Override
+        protected String[] getCommandLineArguments() {
             return mArgs.toArray(new String[mArgs.size()]);
         }
 
@@ -302,8 +295,9 @@ public abstract class CommandLine {
 
             // Append the switch and update the switches/arguments divider mArgsBegin.
             String combinedSwitchString = SWITCH_PREFIX + switchString;
-            if (value != null && !value.isEmpty())
+            if (value != null && !value.isEmpty()) {
                 combinedSwitchString += SWITCH_VALUE_SEPARATOR + value;
+            }
 
             mArgs.add(mArgsBegin++, combinedSwitchString);
         }
@@ -338,6 +332,10 @@ public abstract class CommandLine {
     }
 
     private static class NativeCommandLine extends CommandLine {
+        public NativeCommandLine(@Nullable String[] args) {
+            nativeInit(args);
+        }
+
         @Override
         public boolean hasSwitch(String switchString) {
             return nativeHasSwitch(switchString);
@@ -367,9 +365,22 @@ public abstract class CommandLine {
         public boolean isNativeImplementation() {
             return true;
         }
+
+        @Override
+        protected String[] getCommandLineArguments() {
+            assert false;
+            return null;
+        }
+
+        @Override
+        protected void destroy() {
+            // TODO(https://crbug.com/771205): Downgrade this to an assert once we have eliminated
+            // tests that do this.
+            throw new IllegalStateException("Can't destroy native command line after startup");
+        }
     }
 
-    private static native void nativeReset();
+    private static native void nativeInit(String[] args);
     private static native boolean nativeHasSwitch(String switchString);
     private static native String nativeGetSwitchValue(String switchString);
     private static native void nativeAppendSwitch(String switchString);

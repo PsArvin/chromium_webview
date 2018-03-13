@@ -5,17 +5,16 @@
 package org.chromium.ui.gl;
 
 import android.graphics.SurfaceTexture;
-import android.os.Build;
 import android.util.Log;
 
-import org.chromium.base.CalledByNative;
-import org.chromium.base.JNINamespace;
+import org.chromium.base.annotations.CalledByNative;
+import org.chromium.base.annotations.JNINamespace;
 
 /**
  * Wrapper class for the underlying platform's SurfaceTexture in order to
  * provide a stable JNI API.
  */
-@JNINamespace("gfx")
+@JNINamespace("gl")
 class SurfaceTexturePlatformWrapper {
 
     private static final String TAG = "SurfaceTexturePlatformWrapper";
@@ -48,25 +47,27 @@ class SurfaceTexturePlatformWrapper {
     }
 
     @CalledByNative
-    private static void setDefaultBufferSize(SurfaceTexture surfaceTexture, int width,
-            int height) {
-        surfaceTexture.setDefaultBufferSize(width, height);
-    }
-
-    @CalledByNative
     private static void getTransformMatrix(SurfaceTexture surfaceTexture, float[] matrix) {
         surfaceTexture.getTransformMatrix(matrix);
     }
 
     @CalledByNative
     private static void attachToGLContext(SurfaceTexture surfaceTexture, int texName) {
-        assert Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN;
         surfaceTexture.attachToGLContext(texName);
     }
 
     @CalledByNative
     private static void detachFromGLContext(SurfaceTexture surfaceTexture) {
-        assert Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN;
         surfaceTexture.detachFromGLContext();
+    }
+
+    @CalledByNative
+    private static void release(SurfaceTexture surfaceTexture) {
+        surfaceTexture.release();
+    }
+
+    @CalledByNative
+    private static void setDefaultBufferSize(SurfaceTexture surfaceTexture, int width, int height) {
+        surfaceTexture.setDefaultBufferSize(width, height);
     }
 }

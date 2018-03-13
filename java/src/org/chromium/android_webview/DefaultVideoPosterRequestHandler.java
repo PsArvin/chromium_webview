@@ -33,29 +33,23 @@ public class DefaultVideoPosterRequestHandler {
         // Send the request to UI thread to callback to the client, and if it provides a
         // valid bitmap bounce on to the worker thread pool to compress it into the piped
         // input/output stream.
-        ThreadUtils.runOnUiThread(new Runnable() {
-            @Override
-            public void run() {
-                final Bitmap defaultVideoPoster = contentClient.getDefaultVideoPoster();
-                if (defaultVideoPoster == null) {
-                    closeOutputStream(outputStream);
-                    return;
-                }
-                AsyncTask.THREAD_POOL_EXECUTOR.execute(new Runnable() {
-                    @Override
-                    public void run() {
-                        try {
-                            defaultVideoPoster.compress(Bitmap.CompressFormat.PNG, 100,
-                                    outputStream);
-                            outputStream.flush();
-                        } catch (IOException e) {
-                            Log.e(TAG, null, e);
-                        } finally {
-                            closeOutputStream(outputStream);
-                        }
-                    }
-                });
+        ThreadUtils.runOnUiThread(() -> {
+            final Bitmap defaultVideoPoster = contentClient.getDefaultVideoPoster();
+            if (defaultVideoPoster == null) {
+                closeOutputStream(outputStream);
+                return;
             }
+            AsyncTask.THREAD_POOL_EXECUTOR.execute(() -> {
+                try {
+                    defaultVideoPoster.compress(Bitmap.CompressFormat.PNG, 100,
+                            outputStream);
+                    outputStream.flush();
+                } catch (IOException e) {
+                    Log.e(TAG, null, e);
+                } finally {
+                    closeOutputStream(outputStream);
+                }
+            });
         });
         return inputStream;
     }
@@ -81,14 +75,14 @@ public class DefaultVideoPosterRequestHandler {
      * Used to get the image if the url is mDefaultVideoPosterURL.
      *
      * @param url the url requested
-     * @return InterceptedRequestData which caller can get the image if the url is
+     * @return AwWebResourceResponse which caller can get the image if the url is
      * the default video poster URL, otherwise null is returned.
      */
-    public InterceptedRequestData shouldInterceptRequest(final String url) {
+    public AwWebResourceResponse shouldInterceptRequest(final String url) {
         if (!mDefaultVideoPosterURL.equals(url)) return null;
 
         try {
-            return new InterceptedRequestData("image/png", null, getInputStream(mContentClient));
+            return new AwWebResourceResponse("image/png", null, getInputStream(mContentClient));
         } catch (IOException e) {
             Log.e(TAG, null, e);
             return null;

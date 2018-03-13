@@ -4,12 +4,15 @@
 
 package org.chromium.ui.base;
 
-import android.os.Build;
-import android.text.TextUtils;
+import android.content.res.Configuration;
 import android.view.View;
 
-import org.chromium.base.CalledByNative;
-import org.chromium.base.JNINamespace;
+import org.chromium.base.ApiCompatibilityUtils;
+import org.chromium.base.ContextUtils;
+import org.chromium.base.LocaleUtils;
+import org.chromium.base.VisibleForTesting;
+import org.chromium.base.annotations.CalledByNative;
+import org.chromium.base.annotations.JNINamespace;
 
 import java.util.Locale;
 
@@ -24,31 +27,9 @@ public class LocalizationUtils {
     public static final int RIGHT_TO_LEFT = 1;
     public static final int LEFT_TO_RIGHT = 2;
 
+    private static Boolean sIsLayoutRtl;
+
     private LocalizationUtils() { /* cannot be instantiated */ }
-
-    /**
-     * @return the default locale, translating Android deprecated
-     * language codes into the modern ones used by Chromium.
-     */
-    @CalledByNative
-    public static String getDefaultLocale() {
-        Locale locale = Locale.getDefault();
-        String language = locale.getLanguage();
-        String country = locale.getCountry();
-
-        // Android uses deprecated lanuages codes for Hebrew and Indonesian but Chromium uses the
-        // updated codes. Also, Android uses "tl" while Chromium uses "fil" for Tagalog/Filipino.
-        // So apply a mapping.
-        // See http://developer.android.com/reference/java/util/Locale.html
-        if ("iw".equals(language)) {
-            language = "he";
-        } else if ("in".equals(language)) {
-            language = "id";
-        } else if ("tl".equals(language)) {
-            language = "fil";
-        }
-        return country.isEmpty() ? language : language + "-" + country;
-    }
 
     @CalledByNative
     private static Locale getJavaLocale(String language, String country, String variant) {
@@ -61,24 +42,29 @@ public class LocalizationUtils {
     }
 
     /**
-     * @return true if the system default layout direction is RTL, false otherwise.
-     *         RTL layout support is from Jelly Bean MR1, so if the version is lower
-     *         than that, it is always false.
+     * Returns whether the Android layout direction is RTL.
+     *
+     * Note that the locale direction can be different from layout direction. Two known cases:
+     * - RTL languages on Android 4.1, due to the lack of RTL layout support on 4.1.
+     * - When user turned on force RTL layout option under developer options.
+     *
+     * Therefore, only this function should be used to query RTL for layout purposes.
      */
-    public static boolean isSystemLayoutDirectionRtl() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN_MR1) {
-            return TextUtils.getLayoutDirectionFromLocale(Locale.getDefault())
-                    == View.LAYOUT_DIRECTION_RTL;
+    @CalledByNative
+    public static boolean isLayoutRtl() {
+        if (sIsLayoutRtl == null) {
+            Configuration configuration =
+                    ContextUtils.getApplicationContext().getResources().getConfiguration();
+            sIsLayoutRtl = Boolean.valueOf(ApiCompatibilityUtils.getLayoutDirection(configuration)
+                    == View.LAYOUT_DIRECTION_RTL);
         }
-        return false;
+
+        return sIsLayoutRtl.booleanValue();
     }
 
-    /**
-     * Jni binding to base::i18n::IsRTL.
-     * @return true if the current locale is right to left.
-     */
-    public static boolean isRtl() {
-        return nativeIsRTL();
+    @VisibleForTesting
+    public static void setRtlForTesting(boolean shouldBeRtl) {
+        sIsLayoutRtl = shouldBeRtl;
     }
 
     /**
@@ -87,22 +73,13 @@ public class LocalizationUtils {
      * @return One of the UNKNOWN_DIRECTION, RIGHT_TO_LEFT, and LEFT_TO_RIGHT.
      */
     public static int getFirstStrongCharacterDirection(String string) {
+        assert string != null;
         return nativeGetFirstStrongCharacterDirection(string);
     }
 
-    /**
-     * Jni binding to ui::TimeFormat::TimeRemaining. Converts milliseconds to
-     * time remaining format : "3 mins left", "2 days left".
-     * @param timeInMillis time in milliseconds
-     * @return time remaining
-     */
-    public static String getDurationString(long timeInMillis) {
-        return nativeGetDurationString(timeInMillis);
+    public static String substituteLocalePlaceholder(String str) {
+        return str.replace("$LOCALE", LocaleUtils.getDefaultLocaleString().replace('-', '_'));
     }
 
-    private static native boolean nativeIsRTL();
-
     private static native int nativeGetFirstStrongCharacterDirection(String string);
-
-    private static native String nativeGetDurationString(long timeInMillis);
 }

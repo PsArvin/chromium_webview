@@ -32,7 +32,7 @@ public class HttpAuthDatabase {
 
     private static final int DATABASE_VERSION = 1;
 
-    private SQLiteDatabase mDatabase = null;
+    private SQLiteDatabase mDatabase;
 
     private static final String ID_COL = "_id";
 
@@ -50,25 +50,30 @@ public class HttpAuthDatabase {
     /**
      * Initially false until the background thread completes.
      */
-    private boolean mInitialized = false;
+    private boolean mInitialized;
 
     private final Object mInitializedLock = new Object();
 
     /**
-     * Create an instance of HttpAuthDatabase for the named file, and kick-off background
-     * initialization of that database.
+     * Creates and returns an instance of HttpAuthDatabase for the named file, and kicks-off
+     * background initialization of that database.
      *
      * @param context the Context to use for opening the database
      * @param databaseFile Name of the file to be initialized.
      */
-    public HttpAuthDatabase(final Context context, final String databaseFile) {
+    public static HttpAuthDatabase newInstance(final Context context, final String databaseFile) {
+        final HttpAuthDatabase httpAuthDatabase = new HttpAuthDatabase();
         new Thread() {
             @Override
             public void run() {
-                initOnBackgroundThread(context, databaseFile);
+                httpAuthDatabase.initOnBackgroundThread(context, databaseFile);
             }
         }.start();
+        return httpAuthDatabase;
     }
+
+    // Prevent instantiation. Callers should use newInstance().
+    private HttpAuthDatabase() {}
 
     /**
      * Initializes the databases and notifies any callers waiting on waitForInit.
@@ -195,8 +200,8 @@ public class HttpAuthDatabase {
         final String[] columns = new String[] {
             HTTPAUTH_USERNAME_COL, HTTPAUTH_PASSWORD_COL
         };
-        final String selection = "(" + HTTPAUTH_HOST_COL + " == ?) AND " +
-                "(" + HTTPAUTH_REALM_COL + " == ?)";
+        final String selection = "(" + HTTPAUTH_HOST_COL + " == ?) AND "
+                + "(" + HTTPAUTH_REALM_COL + " == ?)";
 
         String[] ret = null;
         Cursor cursor = null;

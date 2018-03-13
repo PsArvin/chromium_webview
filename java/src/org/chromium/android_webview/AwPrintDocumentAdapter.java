@@ -4,6 +4,7 @@
 
 package org.chromium.android_webview;
 
+import android.annotation.SuppressLint;
 import android.os.Bundle;
 import android.os.CancellationSignal;
 import android.os.ParcelFileDescriptor;
@@ -11,36 +12,50 @@ import android.print.PageRange;
 import android.print.PrintAttributes;
 import android.print.PrintDocumentAdapter;
 import android.print.PrintDocumentInfo;
-import android.webkit.ValueCallback;
 
+import java.util.ArrayList;
 
 /**
  * Adapter for printing Webview. This class implements the abstract
  * system class PrintDocumentAdapter and hides all printing details from
  * the developer.
  */
+@SuppressLint("NewApi")  // Printing requires API level 19.
 public class AwPrintDocumentAdapter extends PrintDocumentAdapter {
 
     private AwPdfExporter mPdfExporter;
     private PrintAttributes mAttributes;
+    private String mDocumentName;
+
+    /**
+     * Constructor.
+     * TODO(sgurun) remove in favor of constructor below once the AOSP changes are in.
+     *
+     * @param pdfExporter The PDF exporter to export the webview contents to a PDF file.
+     */
+    public AwPrintDocumentAdapter(AwPdfExporter pdfExporter) {
+        this(pdfExporter, "default");
+    }
 
     /**
      * Constructor.
      *
      * @param pdfExporter The PDF exporter to export the webview contents to a PDF file.
+     * @param documentName  The name of the pdf document.
      */
-    public AwPrintDocumentAdapter(AwPdfExporter pdfExporter) {
+    public AwPrintDocumentAdapter(AwPdfExporter pdfExporter, String documentName) {
         mPdfExporter = pdfExporter;
+        mDocumentName = documentName;
     }
+
 
     @Override
     public void onLayout(PrintAttributes oldAttributes, PrintAttributes newAttributes,
             CancellationSignal cancellationSignal, LayoutResultCallback callback,
             Bundle metadata) {
         mAttributes = newAttributes;
-        // TODO(sgurun) pass a meaningful string once b/10705082 is resolved
         PrintDocumentInfo documentInfo = new PrintDocumentInfo
-                .Builder("webview")
+                .Builder(mDocumentName)
                 .build();
         // TODO(sgurun) once componentization is done, do layout changes and
         // generate PDF here, set the page range information to documentinfo
@@ -50,19 +65,46 @@ public class AwPrintDocumentAdapter extends PrintDocumentAdapter {
     }
 
     @Override
-    public void onWrite(PageRange[] pages, ParcelFileDescriptor destination,
+    public void onWrite(final PageRange[] pages, ParcelFileDescriptor destination,
             CancellationSignal cancellationSignal, final WriteResultCallback callback) {
-        mPdfExporter.exportToPdf(destination, mAttributes, new ValueCallback<Boolean>() {
-            @Override
-            public void onReceiveValue(Boolean value) {
-                if (value) {
-                    callback.onWriteFinished(new PageRange[] { PageRange.ALL_PAGES });
-                } else {
-                    // TODO(sgurun) provide a localized error message
-                    callback.onWriteFailed(null);
-                }
+        if (pages == null || pages.length == 0) {
+            callback.onWriteFailed(null);
+            return;
+        }
+
+        mPdfExporter.exportToPdf(destination, mAttributes,
+                normalizeRanges(pages), pageCount -> {
+                    if (pageCount > 0) {
+                        callback.onWriteFinished(validatePageRanges(pages, pageCount));
+                    } else {
+                        // TODO(sgurun) provide a localized error message
+                        callback.onWriteFailed(null);
+                    }
+                }, cancellationSignal);
+    }
+
+    private static PageRange[] validatePageRanges(PageRange[] pages, int pageCount) {
+        if (pages.length == 1 && PageRange.ALL_PAGES.equals(pages[0])) {
+            return new PageRange[] {new PageRange(0, pageCount - 1)};
+        }
+        return pages;
+    }
+
+    private static int[] normalizeRanges(final PageRange[] ranges) {
+        if (ranges.length == 1 && PageRange.ALL_PAGES.equals(ranges[0])) {
+            return new int[0];
+        }
+        ArrayList<Integer> pages = new ArrayList<Integer>();
+        for (PageRange range : ranges) {
+            for (int i = range.getStart(); i <= range.getEnd(); ++i) {
+                pages.add(i);
             }
-        }, cancellationSignal);
+        }
+
+        int[] ret = new int[pages.size()];
+        for (int i = 0; i < pages.size(); ++i) {
+            ret[i] = pages.get(i).intValue();
+        }
+        return ret;
     }
 }
-

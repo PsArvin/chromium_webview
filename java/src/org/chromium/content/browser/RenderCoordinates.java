@@ -4,6 +4,8 @@
 
 package org.chromium.content.browser;
 
+import org.chromium.base.VisibleForTesting;
+
 /**
  * Cached copy of all positions and scales (CSS-to-DIP-to-physical pixels)
  * reported from the renderer.
@@ -13,6 +15,7 @@ package org.chromium.content.browser;
  * Unless stated otherwise, all coordinates are in CSS (document) coordinate space.
  */
 public class RenderCoordinates {
+
     // Scroll offset from the native in CSS.
     private float mScrollXCss;
     private float mScrollYCss;
@@ -31,14 +34,17 @@ public class RenderCoordinates {
     private float mMaxPageScaleFactor = 1.0f;
 
     // Cached device density.
-    private float mDeviceScaleFactor;
+    private float mDeviceScaleFactor = 1.0f;
 
-    private float mContentOffsetYPix;
+    private float mTopContentOffsetYPix;
+
+    private boolean mHasFrameInfo;
 
     // Internally-visible set of update methods (used by ContentViewCore).
-    void reset() {
+    public void reset() {
         mScrollXCss = mScrollYCss = 0;
         mPageScaleFactor = 1.0f;
+        mHasFrameInfo = false;
     }
 
     void updateContentSizeCss(float contentWidthCss, float contentHeightCss) {
@@ -46,14 +52,12 @@ public class RenderCoordinates {
         mContentHeightCss = contentHeightCss;
     }
 
-    void setDeviceScaleFactor(float deviceScaleFactor) {
-        mDeviceScaleFactor = deviceScaleFactor;
+    public void setDeviceScaleFactor(float dipScale) {
+        mDeviceScaleFactor = dipScale;
     }
 
-    void updateFrameInfo(
-            float scrollXCss, float scrollYCss,
-            float contentWidthCss, float contentHeightCss,
-            float viewportWidthCss, float viewportHeightCss,
+    public void updateFrameInfo(float scrollXCss, float scrollYCss, float contentWidthCss,
+            float contentHeightCss, float viewportWidthCss, float viewportHeightCss,
             float pageScaleFactor, float minPageScaleFactor, float maxPageScaleFactor,
             float contentOffsetYPix) {
         mScrollXCss = scrollXCss;
@@ -61,11 +65,25 @@ public class RenderCoordinates {
         mPageScaleFactor = pageScaleFactor;
         mMinPageScaleFactor = minPageScaleFactor;
         mMaxPageScaleFactor = maxPageScaleFactor;
-        mContentOffsetYPix = contentOffsetYPix;
+        mTopContentOffsetYPix = contentOffsetYPix;
 
         updateContentSizeCss(contentWidthCss, contentHeightCss);
         mLastFrameViewportWidthCss = viewportWidthCss;
         mLastFrameViewportHeightCss = viewportHeightCss;
+
+        mHasFrameInfo = true;
+    }
+
+    /**
+     * Sets several fields for unit test. (used by {@link CursorAnchorInfoControllerTest}).
+     * @param deviceScaleFactor Device scale factor (maps DIP pixels to physical pixels).
+     * @param contentOffsetYPix Physical on-screen Y offset amount below the browser controls.
+     */
+    @VisibleForTesting
+    public void setFrameInfoForTest(float deviceScaleFactor, float contentOffsetYPix) {
+        reset();
+        mDeviceScaleFactor = deviceScaleFactor;
+        mTopContentOffsetYPix = contentOffsetYPix;
     }
 
     /**
@@ -81,32 +99,44 @@ public class RenderCoordinates {
         /**
          * @return Absolute CSS (document) X coordinate of the point.
          */
-        public float getXAbsoluteCss() { return mXAbsoluteCss; }
+        public float getXAbsoluteCss() {
+            return mXAbsoluteCss;
+        }
 
         /**
          * @return Absolute CSS (document) Y coordinate of the point.
          */
-        public float getYAbsoluteCss() { return mYAbsoluteCss; }
+        public float getYAbsoluteCss() {
+            return mYAbsoluteCss;
+        }
 
         /**
          * @return Local device-scale-unadjusted X coordinate of the point.
          */
-        public float getXLocalDip() { return (mXAbsoluteCss - mScrollXCss) * mPageScaleFactor; }
+        public float getXLocalDip() {
+            return (mXAbsoluteCss - mScrollXCss) * mPageScaleFactor;
+        }
 
         /**
          * @return Local device-scale-unadjusted Y coordinate of the point.
          */
-        public float getYLocalDip() { return (mYAbsoluteCss - mScrollYCss) * mPageScaleFactor; }
+        public float getYLocalDip() {
+            return (mYAbsoluteCss - mScrollYCss) * mPageScaleFactor;
+        }
 
         /**
          * @return Physical (screen) X coordinate of the point.
          */
-        public float getXPix() { return getXLocalDip() * mDeviceScaleFactor; }
+        public float getXPix() {
+            return getXLocalDip() * mDeviceScaleFactor;
+        }
 
         /**
          * @return Physical (screen) Y coordinate of the point.
          */
-        public float getYPix() { return getYLocalDip() * mDeviceScaleFactor + mContentOffsetYPix; }
+        public float getYPix() {
+            return getYLocalDip() * mDeviceScaleFactor + mTopContentOffsetYPix;
+        }
 
         /**
          * Sets the point to the given absolute CSS (document) coordinates.
@@ -143,72 +173,100 @@ public class RenderCoordinates {
     /**
      * @return Horizontal scroll offset in CSS pixels.
      */
-    public float getScrollX() { return mScrollXCss; }
+    public float getScrollX() {
+        return mScrollXCss;
+    }
 
     /**
      * @return Vertical scroll offset in CSS pixels.
      */
-    public float getScrollY() { return mScrollYCss; }
+    public float getScrollY() {
+        return mScrollYCss;
+    }
 
     /**
      * @return Horizontal scroll offset in physical pixels.
      */
-    public float getScrollXPix() { return fromLocalCssToPix(mScrollXCss); }
+    public float getScrollXPix() {
+        return fromLocalCssToPix(mScrollXCss);
+    }
 
     /**
      * @return Vertical scroll offset in physical pixels.
      */
-    public float getScrollYPix() { return fromLocalCssToPix(mScrollYCss); }
+    public float getScrollYPix() {
+        return fromLocalCssToPix(mScrollYCss);
+    }
 
     /**
      * @return Horizontal scroll offset in physical pixels (approx, integer).
      */
-    public int getScrollXPixInt() { return (int) Math.floor(getScrollXPix()); }
+    public int getScrollXPixInt() {
+        return (int) Math.floor(getScrollXPix());
+    }
 
     /**
      * @return Vertical scroll offset in physical pixels (approx, integer).
      */
-    public int getScrollYPixInt() { return (int) Math.floor(getScrollYPix()); }
+    public int getScrollYPixInt() {
+        return (int) Math.floor(getScrollYPix());
+    }
 
     /**
      * @return Width of the content in CSS pixels.
      */
-    public float getContentWidthCss() { return mContentWidthCss; }
+    public float getContentWidthCss() {
+        return mContentWidthCss;
+    }
 
     /**
      * @return Height of the content in CSS pixels.
      */
-    public float getContentHeightCss() { return mContentHeightCss; }
+    public float getContentHeightCss() {
+        return mContentHeightCss;
+    }
 
     /**
      * @return Approximate width of the content in physical pixels.
      */
-    public float getContentWidthPix() { return fromLocalCssToPix(mContentWidthCss); }
+    public float getContentWidthPix() {
+        return fromLocalCssToPix(mContentWidthCss);
+    }
 
     /**
      * @return Approximate height of the content in physical pixels.
      */
-    public float getContentHeightPix() { return fromLocalCssToPix(mContentHeightCss); }
+    public float getContentHeightPix() {
+        return fromLocalCssToPix(mContentHeightCss);
+    }
 
     /**
      * @return Approximate width of the content in physical pixels (integer).
      */
-    public int getContentWidthPixInt() { return (int) Math.ceil(getContentWidthPix()); }
+    public int getContentWidthPixInt() {
+        return (int) Math.ceil(getContentWidthPix());
+    }
 
     /**
      * @return Approximate height of the content in physical pixels (integer).
      */
-    public int getContentHeightPixInt() { return (int) Math.ceil(getContentHeightPix()); }
+    public int getContentHeightPixInt() {
+        return (int) Math.ceil(getContentHeightPix());
+    }
 
     /**
      * @return Render-reported width of the viewport in CSS pixels.
      */
-    public float getLastFrameViewportWidthCss() { return mLastFrameViewportWidthCss; }
+    public float getLastFrameViewportWidthCss() {
+        return mLastFrameViewportWidthCss;
+    }
 
     /**
      * @return Render-reported height of the viewport in CSS pixels.
      */
-    public float getLastFrameViewportHeightCss() { return mLastFrameViewportHeightCss; }
+    public float getLastFrameViewportHeightCss() {
+        return mLastFrameViewportHeightCss;
+    }
 
     /**
      * @return Render-reported width of the viewport in physical pixels (approximate).
@@ -239,43 +297,38 @@ public class RenderCoordinates {
     }
 
     /**
-     * @return The Physical on-screen Y offset amount below the top controls.
+     * @return The Physical on-screen Y offset amount below the browser controls.
      */
     public float getContentOffsetYPix() {
-        return mContentOffsetYPix;
+        return mTopContentOffsetYPix;
     }
 
     /**
      * @return Current page scale factor (maps CSS pixels to DIP pixels).
      */
-    public float getPageScaleFactor() { return mPageScaleFactor; }
+    public float getPageScaleFactor() {
+        return mPageScaleFactor;
+    }
 
     /**
      * @return Minimum page scale factor to be used with the content.
      */
-    public float getMinPageScaleFactor() { return mMinPageScaleFactor; }
+    public float getMinPageScaleFactor() {
+        return mMinPageScaleFactor;
+    }
 
     /**
      * @return Maximum page scale factor to be used with the content.
      */
-    public float getMaxPageScaleFactor() { return mMaxPageScaleFactor; }
+    public float getMaxPageScaleFactor() {
+        return mMaxPageScaleFactor;
+    }
 
     /**
      * @return Current device scale factor (maps DIP pixels to physical pixels).
      */
-    public float getDeviceScaleFactor() { return mDeviceScaleFactor; }
-
-    /**
-     * @return True if the page doesn't allow zoom-in/zoom-out.
-     */
-    public boolean hasFixedPageScale() { return mMinPageScaleFactor == mMaxPageScaleFactor; }
-
-    /**
-     * @return True if the page has a width=device-width or narrower viewport.
-     */
-    public boolean hasMobileViewport() {
-        float windowWidthDip = mPageScaleFactor * mLastFrameViewportWidthCss;
-        return mContentWidthCss <= windowWidthDip;
+    public float getDeviceScaleFactor() {
+        return mDeviceScaleFactor;
     }
 
     /**
@@ -304,6 +357,13 @@ public class RenderCoordinates {
      */
     public int getMaxVerticalScrollPixInt() {
         return (int) Math.floor(getMaxVerticalScrollPix());
+    }
+
+    /**
+     * @return Whether a frame info update has been received.
+     */
+    public boolean hasFrameInfo() {
+        return mHasFrameInfo;
     }
 
     /**

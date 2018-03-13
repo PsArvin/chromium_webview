@@ -16,7 +16,7 @@ import java.security.NoSuchAlgorithmException;
 import java.security.cert.CertificateException;
 import java.security.cert.X509Certificate;
 
-public class SslUtil {
+class SslUtil {
     private static final String TAG = "SslUtil";
 
     /**
@@ -48,13 +48,13 @@ public class SslUtil {
                     X509Util.createCertificateFromBytes(derBytes);
             return new SslCertificate(x509Certificate);
         } catch (CertificateException e) {
-            // A SSL related exception must have occured.  This shouldn't happen.
+            // A SSL related exception must have occurred.  This shouldn't happen.
             Log.w(TAG, "Could not read certificate: " + e);
         } catch (KeyStoreException e) {
-            // A SSL related exception must have occured.  This shouldn't happen.
+            // A SSL related exception must have occurred.  This shouldn't happen.
             Log.w(TAG, "Could not read certificate: " + e);
         } catch (NoSuchAlgorithmException e) {
-            // A SSL related exception must have occured.  This shouldn't happen.
+            // A SSL related exception must have occurred.  This shouldn't happen.
             Log.w(TAG, "Could not read certificate: " + e);
         }
         return null;

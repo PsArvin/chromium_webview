@@ -4,9 +4,12 @@
 
 package org.chromium.android_webview;
 
-import org.chromium.base.CalledByNative;
-import org.chromium.base.JNINamespace;
+import org.chromium.base.annotations.CalledByNative;
+import org.chromium.base.annotations.JNINamespace;
 
+/**
+ * See {@link android.webkit.HttpAuthHandler}.
+ */
 @JNINamespace("android_webview")
 public class AwHttpAuthHandler {
 
@@ -28,7 +31,7 @@ public class AwHttpAuthHandler {
     }
 
     public boolean isFirstAttempt() {
-         return mFirstAttempt;
+        return mFirstAttempt;
     }
 
     @CalledByNative

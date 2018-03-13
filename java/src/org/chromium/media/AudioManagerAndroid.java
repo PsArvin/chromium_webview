@@ -4,6 +4,7 @@
 
 package org.chromium.media;
 
+import android.annotation.TargetApi;
 import android.bluetooth.BluetoothAdapter;
 import android.bluetooth.BluetoothManager;
 import android.content.BroadcastReceiver;
@@ -13,6 +14,10 @@ import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.pm.PackageManager;
 import android.database.ContentObserver;
+import android.hardware.usb.UsbConstants;
+import android.hardware.usb.UsbDevice;
+import android.hardware.usb.UsbInterface;
+import android.hardware.usb.UsbManager;
 import android.media.AudioFormat;
 import android.media.AudioManager;
 import android.media.AudioRecord;
@@ -23,33 +28,53 @@ import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.Process;
 import android.provider.Settings;
-import android.util.Log;
 
-import org.chromium.base.CalledByNative;
-import org.chromium.base.JNINamespace;
+import org.chromium.base.ContextUtils;
+import org.chromium.base.Log;
+import org.chromium.base.annotations.CalledByNative;
+import org.chromium.base.annotations.JNINamespace;
 
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Map;
 
 @JNINamespace("media")
 class AudioManagerAndroid {
-    private static final String TAG = "AudioManagerAndroid";
+    private static final String TAG = "cr.media";
 
     // Set to true to enable debug logs. Avoid in production builds.
     // NOTE: always check in as false.
     private static final boolean DEBUG = false;
 
-    private static boolean runningOnJellyBeanOrHigher() {
-        return Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN;
-    }
+    /**
+     * NonThreadSafe is a helper class used to help verify that methods of a
+     * class are called from the same thread.
+     * Inspired by class in package com.google.android.apps.chrome.utilities.
+     * Is only utilized when DEBUG is set to true.
+     */
+    private static class NonThreadSafe {
+        private final Long mThreadId;
 
-    private static boolean runningOnJellyBeanMR1OrHigher() {
-        return Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN_MR1;
-    }
+        public NonThreadSafe() {
+            if (DEBUG) {
+                mThreadId = Thread.currentThread().getId();
+            } else {
+                // Avoids "Unread field" issue reported by findbugs.
+                mThreadId = 0L;
+            }
+        }
 
-    private static boolean runningOnJellyBeanMR2OrHigher() {
-        return Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN_MR2;
+        /**
+         * Checks if the method is called on the valid thread.
+         * Assigns the current thread if no thread was assigned.
+         */
+        public boolean calledOnValidThread() {
+            if (DEBUG) {
+                return mThreadId.equals(Thread.currentThread().getId());
+            }
+            return true;
+        }
     }
 
     /** Simple container for device information. */
@@ -63,11 +88,31 @@ class AudioManagerAndroid {
         }
 
         @CalledByNative("AudioDeviceName")
-        private String id() { return String.valueOf(mId); }
+        private String id() {
+            return String.valueOf(mId);
+        }
 
         @CalledByNative("AudioDeviceName")
-        private String name() { return mName; }
+        private String name() {
+            return mName;
+        }
     }
+
+    // List if device models which have been vetted for good quality platform
+    // echo cancellation.
+    // NOTE: only add new devices to this list if manual tests have been
+    // performed where the AEC performance is evaluated using e.g. a WebRTC
+    // audio client such as https://apprtc.appspot.com/?r=<ROOM NAME>.
+    private static final String[] SUPPORTED_AEC_MODELS = new String[] {
+            "GT-I9300", // Galaxy S3
+            "GT-I9500", // Galaxy S4
+            "GT-N7105", // Galaxy Note 2
+            "Nexus 4", // Nexus 4
+            "Nexus 5", // Nexus 5
+            "Nexus 7", // Nexus 7
+            "SM-N9005", // Galaxy Note 3
+            "SM-T310", // Galaxy Tab 3 8.0 (WiFi)
+    };
 
     // Supported audio device types.
     private static final int DEVICE_DEFAULT = -2;
@@ -76,7 +121,8 @@ class AudioManagerAndroid {
     private static final int DEVICE_WIRED_HEADSET = 1;
     private static final int DEVICE_EARPIECE = 2;
     private static final int DEVICE_BLUETOOTH_HEADSET = 3;
-    private static final int DEVICE_COUNT = 4;
+    private static final int DEVICE_USB_AUDIO = 4;
+    private static final int DEVICE_COUNT = 5;
 
     // Maps audio device types to string values. This map must be in sync
     // with the device types above.
@@ -84,18 +130,17 @@ class AudioManagerAndroid {
     // localize the name strings by using resource strings.
     // See http://crbug.com/333208 for details.
     private static final String[] DEVICE_NAMES = new String[] {
-        "Speakerphone",
-        "Wired headset",      // With or without microphone.
-        "Headset earpiece",   // Only available on mobile phones.
-        "Bluetooth headset",  // Requires BLUETOOTH permission.
+            "Speakerphone",
+            "Wired headset", // With or without microphone.
+            "Headset earpiece", // Only available on mobile phones.
+            "Bluetooth headset", // Requires BLUETOOTH permission.
+            "USB audio", // Requires Android API level 21 (5.0).
     };
 
     // List of valid device types.
     private static final Integer[] VALID_DEVICES = new Integer[] {
-        DEVICE_SPEAKERPHONE,
-        DEVICE_WIRED_HEADSET,
-        DEVICE_EARPIECE,
-        DEVICE_BLUETOOTH_HEADSET,
+            DEVICE_SPEAKERPHONE, DEVICE_WIRED_HEADSET, DEVICE_EARPIECE, DEVICE_BLUETOOTH_HEADSET,
+            DEVICE_USB_AUDIO,
     };
 
     // Bluetooth audio SCO states. Example of valid state sequence:
@@ -114,26 +159,32 @@ class AudioManagerAndroid {
     private static final int DEFAULT_FRAME_PER_BUFFER = 256;
 
     private final AudioManager mAudioManager;
-    private final Context mContext;
     private final long mNativeAudioManagerAndroid;
 
-    // Enabled during initialization if BLUETOOTH permission is granted.
-    private boolean mHasBluetoothPermission = false;
+    // Enabled during initialization if MODIFY_AUDIO_SETTINGS permission is
+    // granted. Required to shift system-wide audio settings.
+    private boolean mHasModifyAudioSettingsPermission;
 
-    private int mSavedAudioMode = AudioManager.MODE_INVALID;
+    // Enabled during initialization if BLUETOOTH permission is granted.
+    private boolean mHasBluetoothPermission;
 
     // Stores the audio states related to Bluetooth SCO audio, where some
     // states are needed to keep track of intermediate states while the SCO
     // channel is enabled or disabled (switching state can take a few seconds).
     private int mBluetoothScoState = STATE_BLUETOOTH_SCO_INVALID;
 
-    private boolean mIsInitialized = false;
+    private boolean mIsInitialized;
     private boolean mSavedIsSpeakerphoneOn;
     private boolean mSavedIsMicrophoneMute;
 
     // Id of the requested audio device. Can only be modified by
     // call to setDevice().
     private int mRequestedAudioDevice = DEVICE_INVALID;
+
+    // This class should be created, initialized and closed on the audio thread
+    // in the audio manager. We use |mNonThreadSafe| to ensure that this is
+    // the case. Only active when |DEBUG| is set to true.
+    private final NonThreadSafe mNonThreadSafe = new NonThreadSafe();
 
     // Lock to protect |mAudioDevices| and |mRequestedAudioDevice| which can
     // be accessed from the main thread and the audio manager thread.
@@ -143,8 +194,8 @@ class AudioManagerAndroid {
     private boolean[] mAudioDevices = new boolean[DEVICE_COUNT];
 
     private final ContentResolver mContentResolver;
-    private SettingsObserver mSettingsObserver = null;
-    private HandlerThread mSettingsObserverThread = null;
+    private ContentObserver mSettingsObserver;
+    private HandlerThread mSettingsObserverThread;
     private int mCurrentVolume;
 
     // Broadcast receiver for wired headset intent broadcasts.
@@ -158,66 +209,68 @@ class AudioManagerAndroid {
     // Utilized to detect if BT SCO streaming is on or off.
     private BroadcastReceiver mBluetoothScoReceiver;
 
+    // The UsbManager of this system.
+    private final UsbManager mUsbManager;
+    // Broadcast receiver for USB audio devices intent broadcasts.
+    // Utilized to detect if a USB device is attached or detached.
+    private BroadcastReceiver mUsbAudioReceiver;
+
     /** Construction */
     @CalledByNative
     private static AudioManagerAndroid createAudioManagerAndroid(
-            Context context,
             long nativeAudioManagerAndroid) {
-        return new AudioManagerAndroid(context, nativeAudioManagerAndroid);
+        return new AudioManagerAndroid(nativeAudioManagerAndroid);
     }
 
-    private AudioManagerAndroid(Context context, long nativeAudioManagerAndroid) {
-        mContext = context;
+    private AudioManagerAndroid(long nativeAudioManagerAndroid) {
         mNativeAudioManagerAndroid = nativeAudioManagerAndroid;
-        mAudioManager = (AudioManager) mContext.getSystemService(Context.AUDIO_SERVICE);
-        mContentResolver = mContext.getContentResolver();
+        mAudioManager = (AudioManager) ContextUtils.getApplicationContext().getSystemService(
+                Context.AUDIO_SERVICE);
+        mContentResolver = ContextUtils.getApplicationContext().getContentResolver();
+        mUsbManager = (UsbManager) ContextUtils.getApplicationContext().getSystemService(
+                Context.USB_SERVICE);
     }
 
     /**
      * Saves the initial speakerphone and microphone state.
-     * Populates the list of available audio devices and registers receivers
-     * for broadcast intents related to wired headset and Bluetooth devices.
+     * Populates the list of available audio devices and registers receivers for broadcasting
+     * intents related to wired headset and Bluetooth devices and USB audio devices.
      */
     @CalledByNative
     private void init() {
+        checkIfCalledOnValidThread();
         if (DEBUG) logd("init");
-        if (mIsInitialized)
-            return;
+        if (DEBUG) logDeviceInfo();
+        if (mIsInitialized) return;
 
-        for (int i = 0; i < DEVICE_COUNT; ++i) {
-            mAudioDevices[i] = false;
+        // Check if process has MODIFY_AUDIO_SETTINGS and RECORD_AUDIO
+        // permissions. Both are required for full functionality.
+        mHasModifyAudioSettingsPermission = hasPermission(
+                android.Manifest.permission.MODIFY_AUDIO_SETTINGS);
+        if (DEBUG && !mHasModifyAudioSettingsPermission) {
+            logd("MODIFY_AUDIO_SETTINGS permission is missing");
         }
 
         // Initialize audio device list with things we know is always available.
-        if (hasEarpiece()) {
-            mAudioDevices[DEVICE_EARPIECE] = true;
-        }
+        mAudioDevices[DEVICE_EARPIECE] = hasEarpiece();
+        mAudioDevices[DEVICE_WIRED_HEADSET] = hasWiredHeadset();
+        mAudioDevices[DEVICE_USB_AUDIO] = hasUsbAudio();
         mAudioDevices[DEVICE_SPEAKERPHONE] = true;
 
-        // Register receivers for broadcast intents related to Bluetooth device
+        // Register receivers for broadcasting intents related to Bluetooth device
         // and Bluetooth SCO notifications. Requires BLUETOOTH permission.
         registerBluetoothIntentsIfNeeded();
 
-        // Register receiver for broadcast intents related to adding/
+        // Register receiver for broadcasting intents related to adding/
         // removing a wired headset (Intent.ACTION_HEADSET_PLUG).
         registerForWiredHeadsetIntentBroadcast();
 
-        // Start observer for volume changes.
-        // TODO(henrika): try-catch parts below are added as a test to see if
-        // it avoids the crash in init() reported in http://crbug.com/336600.
-        // Should be removed if possible when we understand the reason better.
-        try {
-            mSettingsObserverThread = new HandlerThread("SettingsObserver");
-            mSettingsObserverThread.start();
-            mSettingsObserver = new SettingsObserver(
-                new Handler(mSettingsObserverThread.getLooper()));
-        } catch (Exception e) {
-            // It is fine to rely on code below here to detect failure by
-            // observing mSettingsObserver==null.
-            Log.wtf(TAG, "SettingsObserver exception: ", e);
-        }
+        // Register receiver for broadcasting intents related to adding/removing a
+        // USB audio device (ACTION_USB_DEVICE_ATTACHED/DETACHED);
+        registerForUsbAudioIntentBroadcast();
 
         mIsInitialized = true;
+
         if (DEBUG) reportUpdate();
     }
 
@@ -227,84 +280,88 @@ class AudioManagerAndroid {
      */
     @CalledByNative
     private void close() {
+        checkIfCalledOnValidThread();
         if (DEBUG) logd("close");
-        if (!mIsInitialized)
-            return;
+        if (!mIsInitialized) return;
 
-        if (mSettingsObserverThread != null) {
-            mSettingsObserverThread.quit();
-            try {
-                mSettingsObserverThread.join();
-            } catch (Exception e) {
-                Log.wtf(TAG, "HandlerThread.join() exception: ", e);
-            }
-            mSettingsObserverThread = null;
-        }
-        if (mContentResolver != null) {
-            mContentResolver.unregisterContentObserver(mSettingsObserver);
-            mSettingsObserver = null;
-        }
-
+        stopObservingVolumeChanges();
         unregisterForWiredHeadsetIntentBroadcast();
         unregisterBluetoothIntentsIfNeeded();
+        unregisterForUsbAudioIntentBroadcast();
 
         mIsInitialized = false;
     }
 
     /**
-     * Saves current audio mode and sets audio mode to MODE_IN_COMMUNICATION
-     * if input parameter is true. Restores saved audio mode if input parameter
-     * is false.
+     * Sets audio mode as COMMUNICATION if input parameter is true.
+     * Restores audio mode to NORMAL if input parameter is false.
+     * Required permission: android.Manifest.permission.MODIFY_AUDIO_SETTINGS.
      */
     @CalledByNative
     private void setCommunicationAudioModeOn(boolean on) {
-        if (DEBUG) logd("setCommunicationAudioModeOn(" + on + ")");
+        checkIfCalledOnValidThread();
+        if (DEBUG) logd("setCommunicationAudioModeOn" + on + ")");
+        if (!mIsInitialized) return;
+
+        // The MODIFY_AUDIO_SETTINGS permission is required to allow an
+        // application to modify global audio settings.
+        if (!mHasModifyAudioSettingsPermission) {
+            Log.w(TAG, "MODIFY_AUDIO_SETTINGS is missing => client will run "
+                    + "with reduced functionality");
+            return;
+        }
 
         if (on) {
-            if (mSavedAudioMode != AudioManager.MODE_INVALID) {
-                Log.wtf(TAG, "Audio mode has already been set!");
-                return;
-            }
-
-            // Store the current audio mode the first time we try to
-            // switch to communication mode.
-            try {
-                mSavedAudioMode = mAudioManager.getMode();
-            } catch (SecurityException e) {
-                Log.wtf(TAG, "getMode exception: ", e);
-                logDeviceInfo();
-            }
-
             // Store microphone mute state and speakerphone state so it can
             // be restored when closing.
             mSavedIsSpeakerphoneOn = mAudioManager.isSpeakerphoneOn();
             mSavedIsMicrophoneMute = mAudioManager.isMicrophoneMute();
 
-            try {
-                mAudioManager.setMode(AudioManager.MODE_IN_COMMUNICATION);
-            } catch (SecurityException e) {
-                Log.wtf(TAG, "setMode exception: ", e);
-                logDeviceInfo();
-            }
+            // Start observing volume changes to detect when the
+            // voice/communication stream volume is at its lowest level.
+            // It is only possible to pull down the volume slider to about 20%
+            // of the absolute minimum (slider at far left) in communication
+            // mode but we want to be able to mute it completely.
+            startObservingVolumeChanges();
         } else {
-            if (mSavedAudioMode == AudioManager.MODE_INVALID) {
-                Log.wtf(TAG, "Audio mode has not yet been set!");
-                return;
+            stopObservingVolumeChanges();
+            stopBluetoothSco();
+            synchronized (mLock) {
+                mRequestedAudioDevice = DEVICE_INVALID;
             }
 
             // Restore previously stored audio states.
             setMicrophoneMute(mSavedIsMicrophoneMute);
             setSpeakerphoneOn(mSavedIsSpeakerphoneOn);
+        }
 
+        setCommunicationAudioModeOnInternal(on);
+    }
+
+    /**
+     * Sets audio mode to MODE_IN_COMMUNICATION if input parameter is true.
+     * Restores audio mode to MODE_NORMAL if input parameter is false.
+     */
+    private void setCommunicationAudioModeOnInternal(boolean on) {
+        if (DEBUG) logd("setCommunicationAudioModeOn(" + on + ")");
+
+        if (on) {
+            try {
+                mAudioManager.setMode(AudioManager.MODE_IN_COMMUNICATION);
+            } catch (SecurityException e) {
+                logDeviceInfo();
+                throw e;
+            }
+
+        } else {
             // Restore the mode that was used before we switched to
             // communication mode.
             try {
-                mAudioManager.setMode(mSavedAudioMode);
+                mAudioManager.setMode(AudioManager.MODE_NORMAL);
             } catch (SecurityException e) {
-                Log.wtf(TAG, "setMode exception: ", e);
                 logDeviceInfo();
+                throw e;
             }
-            mSavedAudioMode = AudioManager.MODE_INVALID;
         }
     }
 
@@ -314,14 +371,22 @@ class AudioManagerAndroid {
      * @param deviceId Unique device ID (integer converted to string)
      * representing the selected device. This string is empty if the so-called
      * default device is requested.
+     * Required permissions: android.Manifest.permission.MODIFY_AUDIO_SETTINGS
+     * and android.Manifest.permission.RECORD_AUDIO.
      */
     @CalledByNative
     private boolean setDevice(String deviceId) {
         if (DEBUG) logd("setDevice: " + deviceId);
-        if (!mIsInitialized)
+        if (!mIsInitialized) return false;
+
+        boolean hasRecordAudioPermission = hasPermission(android.Manifest.permission.RECORD_AUDIO);
+        if (!mHasModifyAudioSettingsPermission || !hasRecordAudioPermission) {
+            Log.w(TAG, "Requires MODIFY_AUDIO_SETTINGS and RECORD_AUDIO. "
+                    + "Selected device will not be available for recording");
             return false;
-        int intDeviceId = deviceId.isEmpty() ?
-            DEVICE_DEFAULT : Integer.parseInt(deviceId);
+        }
+
+        int intDeviceId = deviceId.isEmpty() ? DEVICE_DEFAULT : Integer.parseInt(deviceId);
 
         if (intDeviceId == DEVICE_DEFAULT) {
             boolean devices[] = null;
@@ -351,11 +416,21 @@ class AudioManagerAndroid {
      * @return the current list of available audio devices.
      * Note that this call does not trigger any update of the list of devices,
      * it only copies the current state in to the output array.
+     * Required permissions: android.Manifest.permission.MODIFY_AUDIO_SETTINGS
+     * and android.Manifest.permission.RECORD_AUDIO.
      */
     @CalledByNative
     private AudioDeviceName[] getAudioInputDeviceNames() {
-        if (!mIsInitialized)
+        if (DEBUG) logd("getAudioInputDeviceNames");
+        if (!mIsInitialized) return null;
+
+        boolean hasRecordAudioPermission = hasPermission(android.Manifest.permission.RECORD_AUDIO);
+        if (!mHasModifyAudioSettingsPermission || !hasRecordAudioPermission) {
+            Log.w(TAG, "Requires MODIFY_AUDIO_SETTINGS and RECORD_AUDIO. "
+                    + "No audio device will be available for recording");
             return null;
+        }
+
         boolean devices[] = null;
         synchronized (mLock) {
             devices = mAudioDevices.clone();
@@ -375,13 +450,14 @@ class AudioManagerAndroid {
         return array;
     }
 
+    @TargetApi(Build.VERSION_CODES.JELLY_BEAN_MR1)
     @CalledByNative
     private int getNativeOutputSampleRate() {
-        if (runningOnJellyBeanMR1OrHigher()) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN_MR1) {
             String sampleRateString = mAudioManager.getProperty(
                     AudioManager.PROPERTY_OUTPUT_SAMPLE_RATE);
-            return (sampleRateString == null ?
-                    DEFAULT_SAMPLING_RATE : Integer.parseInt(sampleRateString));
+            return sampleRateString == null
+                    ? DEFAULT_SAMPLING_RATE : Integer.parseInt(sampleRateString);
         } else {
             return DEFAULT_SAMPLING_RATE;
         }
@@ -429,36 +505,31 @@ class AudioManagerAndroid {
 
     @CalledByNative
     private boolean isAudioLowLatencySupported() {
-        return mContext.getPackageManager().hasSystemFeature(
+        return ContextUtils.getApplicationContext().getPackageManager().hasSystemFeature(
                 PackageManager.FEATURE_AUDIO_LOW_LATENCY);
     }
 
+    @TargetApi(Build.VERSION_CODES.JELLY_BEAN_MR1)
     @CalledByNative
     private int getAudioLowLatencyOutputFrameSize() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.JELLY_BEAN_MR1) {
+            return DEFAULT_FRAME_PER_BUFFER;
+        }
         String framesPerBuffer =
                 mAudioManager.getProperty(AudioManager.PROPERTY_OUTPUT_FRAMES_PER_BUFFER);
-        return (framesPerBuffer == null ?
-                DEFAULT_FRAME_PER_BUFFER : Integer.parseInt(framesPerBuffer));
+        return framesPerBuffer == null
+                ? DEFAULT_FRAME_PER_BUFFER : Integer.parseInt(framesPerBuffer);
     }
 
     @CalledByNative
-    public static boolean shouldUseAcousticEchoCanceler() {
-        // AcousticEchoCanceler was added in API level 16 (Jelly Bean).
-        if (!runningOnJellyBeanOrHigher()) {
+    private static boolean shouldUseAcousticEchoCanceler() {
+        // Verify that this device is among the supported/tested models.
+        List<String> supportedModels = Arrays.asList(SUPPORTED_AEC_MODELS);
+        if (!supportedModels.contains(Build.MODEL)) {
             return false;
         }
-
-        // Next is a list of device models which have been vetted for good
-        // quality platform echo cancellation.
-        if (!Build.MODEL.equals("SM-T310R") &&  // Galaxy Tab 3 7.0
-            !Build.MODEL.equals("GT-I9300") &&  // Galaxy S3
-            !Build.MODEL.equals("GT-I9500") &&  // Galaxy S4
-            !Build.MODEL.equals("GT-N7105") &&  // Galaxy Note 2
-            !Build.MODEL.equals("SM-N9005") &&  // Galaxy Note 3
-            !Build.MODEL.equals("Nexus 4") &&
-            !Build.MODEL.equals("Nexus 5") &&
-            !Build.MODEL.equals("Nexus 7")) {
-            return false;
+        if (DEBUG && AcousticEchoCanceler.isAvailable()) {
+            logd("Approved for use of hardware acoustic echo canceler.");
         }
 
         // As a final check, verify that the device supports acoustic echo
@@ -467,12 +538,23 @@ class AudioManagerAndroid {
     }
 
     /**
+     * Helper method for debugging purposes. Ensures that method is
+     * called on same thread as this object was created on.
+     */
+    private void checkIfCalledOnValidThread() {
+        if (DEBUG && !mNonThreadSafe.calledOnValidThread()) {
+            throw new IllegalStateException("Method is not called on valid thread");
+        }
+    }
+
+    /**
      * Register for BT intents if we have the BLUETOOTH permission.
      * Also extends the list of available devices with a BT device if one exists.
      */
     private void registerBluetoothIntentsIfNeeded() {
         // Check if this process has the BLUETOOTH permission or not.
-        mHasBluetoothPermission = hasBluetoothPermission();
+        mHasBluetoothPermission = hasPermission(
+                android.Manifest.permission.BLUETOOTH);
 
         // Add a Bluetooth headset to the list of available devices if a BT
         // headset is detected and if we have the BLUETOOTH permission.
@@ -481,11 +563,10 @@ class AudioManagerAndroid {
         // is not sticky and will only be received if a BT headset is connected
         // after this method has been called.
         if (!mHasBluetoothPermission) {
+            Log.w(TAG, "Requires BLUETOOTH permission");
             return;
         }
-        if (hasBluetoothHeadset()) {
-            mAudioDevices[DEVICE_BLUETOOTH_HEADSET] = true;
-        }
+        mAudioDevices[DEVICE_BLUETOOTH_HEADSET] = hasBluetoothHeadset();
 
         // Register receivers for broadcast intents related to changes in
         // Bluetooth headset availability and usage of the SCO channel.
@@ -525,22 +606,29 @@ class AudioManagerAndroid {
         return mAudioManager.isMicrophoneMute();
     }
 
-    /** Gets the current earpice state. */
+    /** Gets the current earpiece state. */
     private boolean hasEarpiece() {
-        return mContext.getPackageManager().hasSystemFeature(
-            PackageManager.FEATURE_TELEPHONY);
+        return ContextUtils.getApplicationContext().getPackageManager().hasSystemFeature(
+                PackageManager.FEATURE_TELEPHONY);
     }
 
-    /** Checks if the process has BLUETOOTH permission or not. */
-    private boolean hasBluetoothPermission() {
-        boolean hasBluetooth = mContext.checkPermission(
-            android.Manifest.permission.BLUETOOTH,
-            Process.myPid(),
-            Process.myUid()) == PackageManager.PERMISSION_GRANTED;
-        if (DEBUG && !hasBluetooth) {
-            logd("BLUETOOTH permission is missing!");
-        }
-        return hasBluetooth;
+    /**
+     * Checks whether a wired headset is connected or not.
+     * This is not a valid indication that audio playback is actually over
+     * the wired headset as audio routing depends on other conditions. We
+     * only use it as an early indicator (during initialization) of an attached
+     * wired headset.
+     */
+    @Deprecated
+    private boolean hasWiredHeadset() {
+        return mAudioManager.isWiredHeadsetOn();
+    }
+
+    /** Checks if the process has as specified permission or not. */
+    private boolean hasPermission(String permission) {
+        return ContextUtils.getApplicationContext().checkPermission(
+                       permission, Process.myPid(), Process.myUid())
+                == PackageManager.PERMISSION_GRANTED;
     }
 
     /**
@@ -548,9 +636,10 @@ class AudioManagerAndroid {
      * android.bluetooth.BluetoothAdapter.getProfileConnectionState() requires
      * the BLUETOOTH permission.
      */
+    @TargetApi(Build.VERSION_CODES.JELLY_BEAN_MR2)
     private boolean hasBluetoothHeadset() {
         if (!mHasBluetoothPermission) {
-            Log.wtf(TAG, "hasBluetoothHeadset() requires BLUETOOTH permission!");
+            Log.w(TAG, "hasBluetoothHeadset() requires BLUETOOTH permission");
             return false;
         }
 
@@ -560,45 +649,69 @@ class AudioManagerAndroid {
         // higher, retrieve it through getSystemService(String) with
         // BLUETOOTH_SERVICE.
         BluetoothAdapter btAdapter = null;
-        if (runningOnJellyBeanMR2OrHigher()) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN_MR2) {
             // Use BluetoothManager to get the BluetoothAdapter for
             // Android 4.3 and above.
-            try {
-                BluetoothManager btManager =
-                        (BluetoothManager)mContext.getSystemService(
-                                Context.BLUETOOTH_SERVICE);
-                btAdapter = btManager.getAdapter();
-            } catch (Exception e) {
-                Log.wtf(TAG, "BluetoothManager.getAdapter exception", e);
-                return false;
-            }
+            BluetoothManager btManager =
+                    (BluetoothManager) ContextUtils.getApplicationContext().getSystemService(
+                            Context.BLUETOOTH_SERVICE);
+            btAdapter = btManager.getAdapter();
         } else {
             // Use static method for Android 4.2 and below to get the
             // BluetoothAdapter.
-            try {
-                btAdapter = BluetoothAdapter.getDefaultAdapter();
-            } catch (Exception e) {
-                Log.wtf(TAG, "BluetoothAdapter.getDefaultAdapter exception", e);
-                return false;
-            }
+            btAdapter = BluetoothAdapter.getDefaultAdapter();
+        }
+
+        if (btAdapter == null) {
+            // Bluetooth not supported on this platform.
+            return false;
         }
 
         int profileConnectionState;
-        try {
-            profileConnectionState = btAdapter.getProfileConnectionState(
+        profileConnectionState = btAdapter.getProfileConnectionState(
                 android.bluetooth.BluetoothProfile.HEADSET);
-        } catch (Exception e) {
-            Log.wtf(TAG, "BluetoothAdapter.getProfileConnectionState exception", e);
-            profileConnectionState =
-                android.bluetooth.BluetoothProfile.STATE_DISCONNECTED;
-        }
 
         // Ensure that Bluetooth is enabled and that a device which supports the
         // headset and handsfree profile is connected.
         // TODO(henrika): it is possible that btAdapter.isEnabled() is
         // redundant. It might be sufficient to only check the profile state.
-        return btAdapter.isEnabled() && profileConnectionState ==
-            android.bluetooth.BluetoothProfile.STATE_CONNECTED;
+        return btAdapter.isEnabled()
+                && profileConnectionState == android.bluetooth.BluetoothProfile.STATE_CONNECTED;
+    }
+
+    /**
+     * Get the current USB audio device state. Android detects a compatible USB digital audio
+     * peripheral and automatically routes audio playback and capture appropriately on Android5.0
+     * and higher in the order of wired headset first, then USB audio device and earpiece at last.
+     */
+    private boolean hasUsbAudio() {
+        // Android 5.0 (API level 21) and above supports USB audio class 1 (UAC1) features for
+        // audio functions, capture and playback, in host mode.
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.LOLLIPOP) return false;
+
+        boolean hasUsbAudio = false;
+        // UsbManager fails internally with NullPointerException on the emulator created without
+        // Google APIs.
+        Map<String, UsbDevice> devices;
+        try {
+            devices = mUsbManager.getDeviceList();
+        } catch (NullPointerException e) {
+            return false;
+        }
+
+        for (UsbDevice device : devices.values()) {
+            // A USB device with USB_CLASS_AUDIO and USB_CLASS_COMM interface is
+            // considerred as a USB audio device here.
+            if (hasUsbAudioCommInterface(device)) {
+                if (DEBUG) {
+                    logd("USB audio device: " + device.getProductName());
+                }
+                hasUsbAudio = true;
+                break;
+            }
+        }
+
+        return hasUsbAudio;
     }
 
     /**
@@ -622,31 +735,36 @@ class AudioManagerAndroid {
                 if (DEBUG) {
                     int microphone = intent.getIntExtra("microphone", HAS_NO_MIC);
                     String name = intent.getStringExtra("name");
-                    logd("BroadcastReceiver.onReceive: a=" + intent.getAction() +
-                        ", s=" + state +
-                        ", m=" + microphone +
-                        ", n=" + name +
-                        ", sb=" + isInitialStickyBroadcast());
+                    logd("BroadcastReceiver.onReceive: a=" + intent.getAction()
+                            + ", s=" + state
+                            + ", m=" + microphone
+                            + ", n=" + name
+                            + ", sb=" + isInitialStickyBroadcast());
                 }
                 switch (state) {
                     case STATE_UNPLUGGED:
                         synchronized (mLock) {
-                            // Wired headset and earpiece are mutually exclusive.
+                            // Wired headset and earpiece and USB audio are mutually exclusive.
                             mAudioDevices[DEVICE_WIRED_HEADSET] = false;
-                            if (hasEarpiece()) {
+                            if (hasUsbAudio()) {
+                                mAudioDevices[DEVICE_USB_AUDIO] = true;
+                                mAudioDevices[DEVICE_EARPIECE] = false;
+                            } else if (hasEarpiece()) {
                                 mAudioDevices[DEVICE_EARPIECE] = true;
+                                mAudioDevices[DEVICE_USB_AUDIO] = false;
                             }
                         }
                         break;
                     case STATE_PLUGGED:
                         synchronized (mLock) {
-                            // Wired headset and earpiece are mutually exclusive.
+                            // Wired headset and earpiece and USB audio are mutually exclusive.
                             mAudioDevices[DEVICE_WIRED_HEADSET] = true;
                             mAudioDevices[DEVICE_EARPIECE] = false;
+                            mAudioDevices[DEVICE_USB_AUDIO] = false;
                         }
                         break;
                     default:
-                        loge("Invalid state!");
+                        loge("Invalid state");
                         break;
                 }
 
@@ -663,12 +781,12 @@ class AudioManagerAndroid {
         // Note: the intent we register for here is sticky, so it'll tell us
         // immediately what the last action was (plugged or unplugged).
         // It will enable us to set the speakerphone correctly.
-        mContext.registerReceiver(mWiredHeadsetReceiver, filter);
+        ContextUtils.getApplicationContext().registerReceiver(mWiredHeadsetReceiver, filter);
     }
 
     /** Unregister receiver for broadcasted ACTION_HEADSET_PLUG intent. */
     private void unregisterForWiredHeadsetIntentBroadcast() {
-        mContext.unregisterReceiver(mWiredHeadsetReceiver);
+        ContextUtils.getApplicationContext().unregisterReceiver(mWiredHeadsetReceiver);
         mWiredHeadsetReceiver = null;
     }
 
@@ -680,7 +798,7 @@ class AudioManagerAndroid {
      */
     private void registerForBluetoothHeadsetIntentBroadcast() {
         IntentFilter filter = new IntentFilter(
-            android.bluetooth.BluetoothHeadset.ACTION_CONNECTION_STATE_CHANGED);
+                android.bluetooth.BluetoothHeadset.ACTION_CONNECTION_STATE_CHANGED);
 
         /** Receiver which handles changes in BT headset availability. */
         mBluetoothHeadsetReceiver = new BroadcastReceiver() {
@@ -690,12 +808,12 @@ class AudioManagerAndroid {
                 // been detected, e.g. BT headset has been connected or
                 // disconnected. This broadcast is *not* sticky.
                 int profileState = intent.getIntExtra(
-                    android.bluetooth.BluetoothHeadset.EXTRA_STATE,
-                    android.bluetooth.BluetoothHeadset.STATE_DISCONNECTED);
+                        android.bluetooth.BluetoothHeadset.EXTRA_STATE,
+                        android.bluetooth.BluetoothHeadset.STATE_DISCONNECTED);
                 if (DEBUG) {
-                    logd("BroadcastReceiver.onReceive: a=" + intent.getAction() +
-                        ", s=" + profileState +
-                        ", sb=" + isInitialStickyBroadcast());
+                    logd("BroadcastReceiver.onReceive: a=" + intent.getAction()
+                            + ", s=" + profileState
+                            + ", sb=" + isInitialStickyBroadcast());
                 }
 
                 switch (profileState) {
@@ -721,25 +839,21 @@ class AudioManagerAndroid {
                         // Bluetooth service is switching from on to off.
                         break;
                     default:
-                        loge("Invalid state!");
+                        loge("Invalid state");
                         break;
                 }
 
-                // Update the existing device selection, but only if a specific
-                // device has already been selected explicitly.
-                if (deviceHasBeenRequested()) {
-                    updateDeviceActivation();
-                } else if (DEBUG) {
+                if (DEBUG) {
                     reportUpdate();
                 }
-           }
+            }
         };
 
-        mContext.registerReceiver(mBluetoothHeadsetReceiver, filter);
+        ContextUtils.getApplicationContext().registerReceiver(mBluetoothHeadsetReceiver, filter);
     }
 
     private void unregisterForBluetoothHeadsetIntentBroadcast() {
-        mContext.unregisterReceiver(mBluetoothHeadsetReceiver);
+        ContextUtils.getApplicationContext().unregisterReceiver(mBluetoothHeadsetReceiver);
         mBluetoothHeadsetReceiver = null;
     }
 
@@ -749,19 +863,19 @@ class AudioManagerAndroid {
      */
     private void registerForBluetoothScoIntentBroadcast() {
         IntentFilter filter = new IntentFilter(
-            AudioManager.ACTION_SCO_AUDIO_STATE_UPDATED);
+                AudioManager.ACTION_SCO_AUDIO_STATE_UPDATED);
 
         /** BroadcastReceiver implementation which handles changes in BT SCO. */
         mBluetoothScoReceiver = new BroadcastReceiver() {
             @Override
             public void onReceive(Context context, Intent intent) {
                 int state = intent.getIntExtra(
-                    AudioManager.EXTRA_SCO_AUDIO_STATE,
-                    AudioManager.SCO_AUDIO_STATE_DISCONNECTED);
+                        AudioManager.EXTRA_SCO_AUDIO_STATE,
+                        AudioManager.SCO_AUDIO_STATE_DISCONNECTED);
                 if (DEBUG) {
-                    logd("BroadcastReceiver.onReceive: a=" + intent.getAction() +
-                        ", s=" + state +
-                        ", sb=" + isInitialStickyBroadcast());
+                    logd("BroadcastReceiver.onReceive: a=" + intent.getAction()
+                            + ", s=" + state
+                            + ", sb=" + isInitialStickyBroadcast());
                 }
 
                 switch (state) {
@@ -769,25 +883,33 @@ class AudioManagerAndroid {
                         mBluetoothScoState = STATE_BLUETOOTH_SCO_ON;
                         break;
                     case AudioManager.SCO_AUDIO_STATE_DISCONNECTED:
+                        if (mBluetoothScoState != STATE_BLUETOOTH_SCO_TURNING_OFF) {
+                            // Bluetooth is probably powered off during the call.
+                            // Update the existing device selection, but only if a specific
+                            // device has already been selected explicitly.
+                            if (deviceHasBeenRequested()) {
+                                updateDeviceActivation();
+                            }
+                        }
                         mBluetoothScoState = STATE_BLUETOOTH_SCO_OFF;
                         break;
                     case AudioManager.SCO_AUDIO_STATE_CONNECTING:
                         // do nothing
                         break;
                     default:
-                        loge("Invalid state!");
+                        loge("Invalid state");
                 }
                 if (DEBUG) {
                     reportUpdate();
                 }
-           }
+            }
         };
 
-        mContext.registerReceiver(mBluetoothScoReceiver, filter);
+        ContextUtils.getApplicationContext().registerReceiver(mBluetoothScoReceiver, filter);
     }
 
     private void unregisterForBluetoothScoIntentBroadcast() {
-        mContext.unregisterReceiver(mBluetoothScoReceiver);
+        ContextUtils.getApplicationContext().unregisterReceiver(mBluetoothScoReceiver);
         mBluetoothScoReceiver = null;
     }
 
@@ -796,8 +918,8 @@ class AudioManagerAndroid {
         if (!mHasBluetoothPermission) {
             return;
         }
-        if (mBluetoothScoState == STATE_BLUETOOTH_SCO_ON ||
-            mBluetoothScoState == STATE_BLUETOOTH_SCO_TURNING_ON) {
+        if (mBluetoothScoState == STATE_BLUETOOTH_SCO_ON
+                || mBluetoothScoState == STATE_BLUETOOTH_SCO_TURNING_ON) {
             // Unable to turn on BT in this state.
             return;
         }
@@ -819,14 +941,15 @@ class AudioManagerAndroid {
         if (!mHasBluetoothPermission) {
             return;
         }
-        if (mBluetoothScoState != STATE_BLUETOOTH_SCO_ON &&
-            mBluetoothScoState != STATE_BLUETOOTH_SCO_TURNING_ON) {
+        if (mBluetoothScoState != STATE_BLUETOOTH_SCO_ON
+                && mBluetoothScoState != STATE_BLUETOOTH_SCO_TURNING_ON) {
             // No need to turn off BT in this state.
             return;
         }
         if (!mAudioManager.isBluetoothScoOn()) {
             // TODO(henrika): can we do anything else than logging here?
-            loge("Unable to stop BT SCO since it is already disabled!");
+            loge("Unable to stop BT SCO since it is already disabled");
+            mBluetoothScoState = STATE_BLUETOOTH_SCO_OFF;
             return;
         }
 
@@ -863,8 +986,11 @@ class AudioManagerAndroid {
             case DEVICE_EARPIECE:
                 setSpeakerphoneOn(false);
                 break;
+            case DEVICE_USB_AUDIO:
+                setSpeakerphoneOn(false);
+                break;
             default:
-                loge("Invalid audio device selection!");
+                loge("Invalid audio device selection");
                 break;
         }
         reportUpdate();
@@ -872,12 +998,14 @@ class AudioManagerAndroid {
 
     /**
      * Use a special selection scheme if the default device is selected.
-     * The "most unique" device will be selected; Wired headset first,
-     * then Bluetooth and last the speaker phone.
+     * The "most unique" device will be selected; Wired headset first, then USB
+     * audio device, then Bluetooth and last the speaker phone.
      */
     private static int selectDefaultDevice(boolean[] devices) {
         if (devices[DEVICE_WIRED_HEADSET]) {
             return DEVICE_WIRED_HEADSET;
+        } else if (devices[DEVICE_USB_AUDIO]) {
+            return DEVICE_USB_AUDIO;
         } else if (devices[DEVICE_BLUETOOTH_HEADSET]) {
             // TODO(henrika): possibly need improvements here if we are
             // in a state where Bluetooth is turning off.
@@ -906,7 +1034,7 @@ class AudioManagerAndroid {
             devices = mAudioDevices.clone();
         }
         if (requested == DEVICE_INVALID) {
-            loge("Unable to activate device since no device is selected!");
+            loge("Unable to activate device since no device is selected");
             return;
         }
 
@@ -927,8 +1055,7 @@ class AudioManagerAndroid {
     private static int getNumOfAudioDevices(boolean[] devices) {
         int count = 0;
         for (int i = 0; i < DEVICE_COUNT; ++i) {
-            if (devices[i])
-                ++count;
+            if (devices[i]) ++count;
         }
         return count;
     }
@@ -940,24 +1067,30 @@ class AudioManagerAndroid {
      * TODO(henrika): add support for state change listener.
      */
     private void reportUpdate() {
-        synchronized (mLock) {
-            List<String> devices = new ArrayList<String>();
-            for (int i = 0; i < DEVICE_COUNT; ++i) {
-                if (mAudioDevices[i])
-                    devices.add(DEVICE_NAMES[i]);
-            }
-            if (DEBUG) {
-                logd("reportUpdate: requested=" + mRequestedAudioDevice +
-                    ", btSco=" + mBluetoothScoState +
-                    ", devices=" + devices);
+        if (DEBUG) {
+            synchronized (mLock) {
+                List<String> devices = new ArrayList<String>();
+                for (int i = 0; i < DEVICE_COUNT; ++i) {
+                    if (mAudioDevices[i]) devices.add(DEVICE_NAMES[i]);
+                }
+                logd("reportUpdate: requested=" + mRequestedAudioDevice
+                        + ", btSco=" + mBluetoothScoState
+                        + ", devices=" + devices);
             }
         }
     }
 
+    /** Information about the current build, taken from system properties. */
     private void logDeviceInfo() {
-        Log.i(TAG, "Manufacturer:" + Build.MANUFACTURER +
-                " Board: " + Build.BOARD + " Device: " + Build.DEVICE +
-                " Model: " + Build.MODEL + " PRODUCT: " + Build.PRODUCT);
+        logd("Android SDK: " + Build.VERSION.SDK_INT + ", "
+                + "Release: " + Build.VERSION.RELEASE + ", "
+                + "Brand: " + Build.BRAND + ", "
+                + "Device: " + Build.DEVICE + ", "
+                + "Id: " + Build.ID + ", "
+                + "Hardware: " + Build.HARDWARE + ", "
+                + "Manufacturer: " + Build.MANUFACTURER + ", "
+                + "Model: " + Build.MODEL + ", "
+                + "Product: " + Build.PRODUCT);
     }
 
     /** Trivial helper method for debug logging */
@@ -970,20 +1103,150 @@ class AudioManagerAndroid {
         Log.e(TAG, msg);
     }
 
-    private class SettingsObserver extends ContentObserver {
-        SettingsObserver(Handler handler) {
-            super(handler);
-            mContentResolver.registerContentObserver(Settings.System.CONTENT_URI, true, this);
+    /** Start thread which observes volume changes on the voice stream. */
+    private void startObservingVolumeChanges() {
+        if (DEBUG) logd("startObservingVolumeChanges");
+        if (mSettingsObserverThread != null) return;
+        mSettingsObserverThread = new HandlerThread("SettingsObserver");
+        mSettingsObserverThread.start();
+
+        mSettingsObserver = new ContentObserver(
+            new Handler(mSettingsObserverThread.getLooper())) {
+
+                @Override
+                public void onChange(boolean selfChange) {
+                    if (DEBUG) logd("SettingsObserver.onChange: " + selfChange);
+                    super.onChange(selfChange);
+
+                    /**
+                     * According to https://crbug.com/488332, on some Samsung devices we may
+                     * fail to verify the mode is MODE_IN_COMMUNICATION as we set previously.
+                     * Disable the check as a temporary fix until we understand what's going on.
+                    // Ensure that the observer is activated during communication mode.
+                    if (mAudioManager.getMode() != AudioManager.MODE_IN_COMMUNICATION) {
+                        throw new IllegalStateException(
+                                "Only enable SettingsObserver in COMM mode");
+                    }*/
+
+                    // Get stream volume for the voice stream and deliver callback if
+                    // the volume index is zero. It is not possible to move the volume
+                    // slider all the way down in communication mode but the callback
+                    // implementation can ensure that the volume is completely muted.
+                    int volume = mAudioManager.getStreamVolume(AudioManager.STREAM_VOICE_CALL);
+                    if (DEBUG) logd("nativeSetMute: " + (volume == 0));
+                    nativeSetMute(mNativeAudioManagerAndroid, (volume == 0));
+                }
+        };
+
+        mContentResolver.registerContentObserver(
+                Settings.System.CONTENT_URI, true, mSettingsObserver);
+    }
+
+    /** Quit observer thread and stop listening for volume changes. */
+    private void stopObservingVolumeChanges() {
+        if (DEBUG) logd("stopObservingVolumeChanges");
+        if (mSettingsObserverThread == null) return;
+
+        mContentResolver.unregisterContentObserver(mSettingsObserver);
+        mSettingsObserver = null;
+
+        mSettingsObserverThread.quit();
+        try {
+            mSettingsObserverThread.join();
+        } catch (InterruptedException e) {
+            Log.e(TAG, "Thread.join() exception: ", e);
+        }
+        mSettingsObserverThread = null;
+    }
+
+    /**
+     * Enumrates the USB interfaces of the given USB device for interface with USB_CLASS_AUDIO
+     * class (USB class for audio devices) and USB_CLASS_COMM subclass (USB class for communication
+     * devices). Any device that supports these conditions will be considered a USB audio device.
+     *
+     * @param device USB device to be checked.
+     * @return Whether the USB device has such an interface.
+     */
+
+    private boolean hasUsbAudioCommInterface(UsbDevice device) {
+        boolean hasUsbAudioCommInterface = false;
+        for (int i = 0; i < device.getInterfaceCount(); ++i) {
+            UsbInterface iface = device.getInterface(i);
+            if (iface.getInterfaceClass() == UsbConstants.USB_CLASS_AUDIO
+                    && iface.getInterfaceSubclass() == UsbConstants.USB_CLASS_COMM) {
+                // There is at least one interface supporting audio communication.
+                hasUsbAudioCommInterface = true;
+                break;
+            }
         }
 
-        @Override
-        public void onChange(boolean selfChange) {
-            if (DEBUG) logd("SettingsObserver.onChange: " + selfChange);
-            super.onChange(selfChange);
-            int volume = mAudioManager.getStreamVolume(AudioManager.STREAM_VOICE_CALL);
-            if (DEBUG) logd("nativeSetMute: " + (volume == 0));
-            nativeSetMute(mNativeAudioManagerAndroid, (volume == 0));
-        }
+        return hasUsbAudioCommInterface;
+    }
+
+    /**
+     * Registers receiver for the broadcasted intent when a USB device is plugged in or unplugged.
+     * Notice: Android supports multiple USB audio devices connected through a USB hub and OS will
+     * select the capture device and playback device from them. But plugging them in/out during a
+     * call may cause some unexpected result, i.e capturing error or zero capture length.
+     */
+    private void registerForUsbAudioIntentBroadcast() {
+        mUsbAudioReceiver = new BroadcastReceiver() {
+            @Override
+            public void onReceive(Context context, Intent intent) {
+                UsbDevice device = intent.getParcelableExtra(UsbManager.EXTRA_DEVICE);
+                if (DEBUG) {
+                    logd("UsbDeviceBroadcastReceiver.onReceive: a= " + intent.getAction()
+                            + ", Device: " + device.toString());
+                }
+
+                // Not a USB audio device.
+                if (!hasUsbAudioCommInterface(device)) return;
+
+                if (UsbManager.ACTION_USB_DEVICE_ATTACHED.equals(intent.getAction())) {
+                    synchronized (mLock) {
+                        // Wired headset and earpiece and USB audio are mutually exclusive.
+                        if (!hasWiredHeadset()) {
+                            mAudioDevices[DEVICE_USB_AUDIO] = true;
+                            mAudioDevices[DEVICE_EARPIECE] = false;
+                        }
+                    }
+                } else if (UsbManager.ACTION_USB_DEVICE_DETACHED.equals(intent.getAction())
+                        && !hasUsbAudio()) {
+                    // When a USB audio device is detached, we need to check if there is any other
+                    // USB audio device still connected, e.g. through a USB hub.
+                    // Only update the device list when there is no more USB audio device attached.
+                    synchronized (mLock) {
+                        if (!hasWiredHeadset()) {
+                            mAudioDevices[DEVICE_USB_AUDIO] = false;
+                            // Wired headset and earpiece and USB audio are mutually exclusive.
+                            if (hasEarpiece()) {
+                                mAudioDevices[DEVICE_EARPIECE] = true;
+                            }
+                        }
+                    }
+                }
+
+                // Update the existing device selection, but only if a specific
+                // device has already been selected explicitly.
+                if (deviceHasBeenRequested()) {
+                    updateDeviceActivation();
+                } else if (DEBUG) {
+                    reportUpdate();
+                }
+            }
+        };
+
+        IntentFilter filter = new IntentFilter();
+        filter.addAction(UsbManager.ACTION_USB_DEVICE_ATTACHED);
+        filter.addAction(UsbManager.ACTION_USB_DEVICE_DETACHED);
+
+        ContextUtils.getApplicationContext().registerReceiver(mUsbAudioReceiver, filter);
+    }
+
+    /** Unregister receiver for broadcasted ACTION_USB_DEVICE_ATTACHED/DETACHED intent. */
+    private void unregisterForUsbAudioIntentBroadcast() {
+        ContextUtils.getApplicationContext().unregisterReceiver(mUsbAudioReceiver);
+        mUsbAudioReceiver = null;
     }
 
     private native void nativeSetMute(long nativeAudioManagerAndroid, boolean muted);

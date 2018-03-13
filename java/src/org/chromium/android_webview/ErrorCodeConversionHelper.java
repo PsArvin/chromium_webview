@@ -4,44 +4,49 @@
 
 package org.chromium.android_webview;
 
+import android.webkit.WebViewClient;
+
 import org.chromium.net.NetError;
 
 /**
  * This is a helper class to map native error code about loading a page to Android specific ones.
  */
-public abstract class ErrorCodeConversionHelper {
+public final class ErrorCodeConversionHelper {
     // Success
     public static final int ERROR_OK = 0;
     // Generic error
-    public static final int ERROR_UNKNOWN = -1;
+    public static final int ERROR_UNKNOWN = WebViewClient.ERROR_UNKNOWN;
     // Server or proxy hostname lookup failed
-    public static final int ERROR_HOST_LOOKUP = -2;
+    public static final int ERROR_HOST_LOOKUP = WebViewClient.ERROR_HOST_LOOKUP;
     // Unsupported authentication scheme (not basic or digest)
-    public static final int ERROR_UNSUPPORTED_AUTH_SCHEME = -3;
+    public static final int ERROR_UNSUPPORTED_AUTH_SCHEME =
+            WebViewClient.ERROR_UNSUPPORTED_AUTH_SCHEME;
     // User authentication failed on server
-    public static final int ERROR_AUTHENTICATION = -4;
+    public static final int ERROR_AUTHENTICATION = WebViewClient.ERROR_AUTHENTICATION;
     // User authentication failed on proxy
-    public static final int ERROR_PROXY_AUTHENTICATION = -5;
+    public static final int ERROR_PROXY_AUTHENTICATION = WebViewClient.ERROR_PROXY_AUTHENTICATION;
     // Failed to connect to the server
-    public static final int ERROR_CONNECT = -6;
+    public static final int ERROR_CONNECT = WebViewClient.ERROR_CONNECT;
     // Failed to read or write to the server
-    public static final int ERROR_IO = -7;
+    public static final int ERROR_IO = WebViewClient.ERROR_IO;
     // Connection timed out
-    public static final int ERROR_TIMEOUT = -8;
+    public static final int ERROR_TIMEOUT = WebViewClient.ERROR_TIMEOUT;
     // Too many redirects
-    public static final int ERROR_REDIRECT_LOOP = -9;
+    public static final int ERROR_REDIRECT_LOOP = WebViewClient.ERROR_REDIRECT_LOOP;
     // Unsupported URI scheme
-    public static final int ERROR_UNSUPPORTED_SCHEME = -10;
+    public static final int ERROR_UNSUPPORTED_SCHEME = WebViewClient.ERROR_UNSUPPORTED_SCHEME;
     // Failed to perform SSL handshake
-    public static final int ERROR_FAILED_SSL_HANDSHAKE = -11;
+    public static final int ERROR_FAILED_SSL_HANDSHAKE = WebViewClient.ERROR_FAILED_SSL_HANDSHAKE;
     // Malformed URL
-    public static final int ERROR_BAD_URL = -12;
+    public static final int ERROR_BAD_URL = WebViewClient.ERROR_BAD_URL;
     // Generic file error
-    public static final int ERROR_FILE = -13;
+    public static final int ERROR_FILE = WebViewClient.ERROR_FILE;
     // File not found
-    public static final int ERROR_FILE_NOT_FOUND = -14;
+    public static final int ERROR_FILE_NOT_FOUND = WebViewClient.ERROR_FILE_NOT_FOUND;
     // Too many requests during this load
-    public static final int ERROR_TOO_MANY_REQUESTS = -15;
+    public static final int ERROR_TOO_MANY_REQUESTS = WebViewClient.ERROR_TOO_MANY_REQUESTS;
+    // Request was identified as a bad url by safebrowsing.
+    public static final int ERROR_UNSAFE_RESOURCE = WebViewClient.ERROR_UNSAFE_RESOURCE;
 
     static int convertErrorCode(int netError) {
         // Note: many NetError.Error constants don't have an obvious mapping.
@@ -84,6 +89,7 @@ public abstract class ErrorCodeConversionHelper {
             case NetError.ERR_OUT_OF_MEMORY:
                 return ERROR_TOO_MANY_REQUESTS;
 
+            case NetError.ERR_BLOCKED_BY_ADMINISTRATOR:
             case NetError.ERR_CONNECTION_CLOSED:
             case NetError.ERR_CONNECTION_RESET:
             case NetError.ERR_CONNECTION_REFUSED:
@@ -97,6 +103,7 @@ public abstract class ErrorCodeConversionHelper {
             case NetError.ERR_ADDRESS_UNREACHABLE:
             case NetError.ERR_NAME_NOT_RESOLVED:
             case NetError.ERR_NAME_RESOLUTION_FAILED:
+            case NetError.ERR_ICANN_NAME_COLLISION:
                 return ERROR_HOST_LOOKUP;
 
             case NetError.ERR_SSL_PROTOCOL_ERROR:
@@ -110,7 +117,6 @@ public abstract class ErrorCodeConversionHelper {
             case NetError.ERR_SSL_NO_RENEGOTIATION:
             case NetError.ERR_SSL_DECOMPRESSION_FAILURE_ALERT:
             case NetError.ERR_SSL_BAD_RECORD_MAC_ALERT:
-            case NetError.ERR_SSL_UNSAFE_NEGOTIATION:
             case NetError.ERR_SSL_WEAK_SERVER_EPHEMERAL_DH_KEY:
             case NetError.ERR_SSL_CLIENT_AUTH_PRIVATE_KEY_ACCESS_DENIED:
             case NetError.ERR_SSL_CLIENT_AUTH_CERT_NO_PRIVATE_KEY:
@@ -140,4 +146,7 @@ public abstract class ErrorCodeConversionHelper {
                 return ERROR_UNKNOWN;
         }
     }
+
+    // Do not instantiate this class.
+    private ErrorCodeConversionHelper() {}
 }

@@ -4,62 +4,108 @@
 
 package org.chromium.android_webview;
 
+import android.annotation.SuppressLint;
+import android.annotation.TargetApi;
 import android.app.Activity;
 import android.content.ComponentCallbacks2;
 import android.content.Context;
+import android.content.Intent;
 import android.content.res.Configuration;
 import android.graphics.Bitmap;
 import android.graphics.Canvas;
 import android.graphics.Color;
+import android.graphics.ColorMatrix;
+import android.graphics.ColorMatrixColorFilter;
+import android.graphics.Paint;
 import android.graphics.Picture;
 import android.graphics.Rect;
+import android.net.Uri;
 import android.net.http.SslCertificate;
 import android.os.AsyncTask;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Handler;
 import android.os.Message;
+import android.os.SystemClock;
+import android.support.annotation.IntDef;
 import android.text.TextUtils;
-import android.util.Log;
+import android.util.Base64;
+import android.util.Pair;
+import android.util.SparseArray;
+import android.view.DragEvent;
 import android.view.KeyEvent;
 import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewGroup;
-import android.view.accessibility.AccessibilityEvent;
-import android.view.accessibility.AccessibilityNodeInfo;
+import android.view.ViewStructure;
 import android.view.accessibility.AccessibilityNodeProvider;
+import android.view.animation.AnimationUtils;
+import android.view.autofill.AutofillValue;
 import android.view.inputmethod.EditorInfo;
 import android.view.inputmethod.InputConnection;
-import android.webkit.GeolocationPermissions;
-import android.webkit.ValueCallback;
-import android.widget.OverScroller;
+import android.view.textclassifier.TextClassifier;
+import android.webkit.JavascriptInterface;
 
-import com.google.common.annotations.VisibleForTesting;
-
-import org.chromium.base.CalledByNative;
-import org.chromium.base.JNINamespace;
+import org.chromium.android_webview.permission.AwGeolocationCallback;
+import org.chromium.android_webview.permission.AwPermissionRequest;
+import org.chromium.android_webview.renderer_priority.RendererPriority;
+import org.chromium.base.Callback;
+import org.chromium.base.LocaleUtils;
+import org.chromium.base.Log;
+import org.chromium.base.ObserverList;
 import org.chromium.base.ThreadUtils;
+import org.chromium.base.TraceEvent;
+import org.chromium.base.VisibleForTesting;
+import org.chromium.base.annotations.CalledByNative;
+import org.chromium.base.annotations.JNINamespace;
+import org.chromium.base.metrics.RecordHistogram;
+import org.chromium.blink_public.web.WebReferrerPolicy;
+import org.chromium.components.autofill.AutofillProvider;
 import org.chromium.components.navigation_interception.InterceptNavigationDelegate;
 import org.chromium.components.navigation_interception.NavigationParams;
-import org.chromium.content.browser.ContentSettings;
-import org.chromium.content.browser.ContentViewClient;
-import org.chromium.content.browser.ContentViewCore;
+import org.chromium.content.browser.AppWebMessagePort;
 import org.chromium.content.browser.ContentViewStatics;
-import org.chromium.content.browser.LoadUrlParams;
-import org.chromium.content.browser.NavigationHistory;
-import org.chromium.content.browser.PageTransitionTypes;
-import org.chromium.content.common.CleanupReference;
+import org.chromium.content_public.browser.ChildProcessImportance;
+import org.chromium.content_public.browser.ContentViewCore;
+import org.chromium.content_public.browser.GestureListenerManager;
 import org.chromium.content_public.browser.GestureStateListener;
+import org.chromium.content_public.browser.ImeAdapter;
+import org.chromium.content_public.browser.ImeEventObserver;
+import org.chromium.content_public.browser.JavaScriptCallback;
+import org.chromium.content_public.browser.JavascriptInjector;
+import org.chromium.content_public.browser.LoadUrlParams;
+import org.chromium.content_public.browser.MessagePort;
+import org.chromium.content_public.browser.NavigationController;
+import org.chromium.content_public.browser.NavigationHistory;
+import org.chromium.content_public.browser.SelectionClient;
+import org.chromium.content_public.browser.SelectionPopupController;
+import org.chromium.content_public.browser.SmartClipProvider;
+import org.chromium.content_public.browser.WebContents;
+import org.chromium.content_public.browser.WebContentsAccessibility;
+import org.chromium.content_public.browser.WebContentsInternals;
+import org.chromium.content_public.browser.navigation_controller.LoadURLType;
+import org.chromium.content_public.browser.navigation_controller.UserAgentOverrideOption;
+import org.chromium.content_public.common.BrowserSideNavigationPolicy;
+import org.chromium.content_public.common.ContentUrlConstants;
+import org.chromium.content_public.common.Referrer;
+import org.chromium.content_public.common.UseZoomForDSFPolicy;
+import org.chromium.device.gamepad.GamepadList;
+import org.chromium.net.NetworkChangeNotifier;
 import org.chromium.ui.base.ActivityWindowAndroid;
+import org.chromium.ui.base.PageTransition;
+import org.chromium.ui.base.ViewAndroidDelegate;
 import org.chromium.ui.base.WindowAndroid;
-import org.chromium.ui.gfx.DeviceDisplayInfo;
+import org.chromium.ui.display.DisplayAndroid.DisplayAndroidObserver;
 
 import java.io.File;
 import java.lang.annotation.Annotation;
+import java.lang.ref.WeakReference;
 import java.net.MalformedURLException;
 import java.net.URL;
-import java.util.ArrayList;
 import java.util.HashMap;
-import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.WeakHashMap;
 import java.util.concurrent.Callable;
 
 /**
@@ -68,20 +114,50 @@ import java.util.concurrent.Callable;
  * primary entry point for the WebViewProvider implementation; it holds a 1:1 object
  * relationship with application WebView instances.
  * (We define this class independent of the hidden WebViewProvider interfaces, to allow
- * continuous build & test in the open source SDK-based tree).
+ * continuous build &amp; test in the open source SDK-based tree).
  */
 @JNINamespace("android_webview")
-public class AwContents {
+public class AwContents implements SmartClipProvider {
     private static final String TAG = "AwContents";
+    private static final boolean TRACE = false;
+    private static final int NO_WARN = 0;
+    private static final int WARN = 1;
+    private static final String PRODUCT_VERSION = AwContentsStatics.getProductVersion();
 
     private static final String WEB_ARCHIVE_EXTENSION = ".mht";
+    // The request code should be unique per WebView/AwContents object.
+    private static final int PROCESS_TEXT_REQUEST_CODE = 100;
 
     // Used to avoid enabling zooming in / out if resulting zooming will
     // produce little visible difference.
     private static final float ZOOM_CONTROLS_EPSILON = 0.007f;
 
+    private static final double MIN_SCREEN_HEIGHT_PERCENTAGE_FOR_INTERSTITIAL = 0.7;
+
+    private static final String SAMSUNG_WORKAROUND_PACKAGE_NAME = "com.android.email";
+    private static final String SAMSUNG_WORKAROUND_BASE_URL = "email://";
+    private static final int SAMSUNG_WORKAROUND_DELAY = 200;
+
+    private static class ForceAuxiliaryBitmapRendering {
+        private static final boolean sResult = lazyCheck();
+        private static boolean lazyCheck() {
+            return "goldfish".equals(Build.HARDWARE) || "ranchu".equals(Build.HARDWARE)
+                    || !nativeHasRequiredHardwareExtensions();
+        }
+    }
+
+    // Used to record the UMA histogram WebView.LoadDataWithBaseUrl.HistoryUrl. Since these values
+    // are persisted to logs, they should never be renumbered nor reused.
+    @IntDef({HistoryUrl.EMPTY, HistoryUrl.BASEURL, HistoryUrl.DIFFERENT, HistoryUrl.COUNT})
+    @interface HistoryUrl {
+        int EMPTY = 0;
+        int BASEURL = 1;
+        int DIFFERENT = 2;
+        int COUNT = 3;
+    }
+
     /**
-     * WebKit hit test related data strcutre. These are used to implement
+     * WebKit hit test related data structure. These are used to implement
      * getHitTestResult, requestFocusNodeHref, requestImageRef methods in WebView.
      * All values should be updated together. The native counterpart is
      * AwHitTestData.
@@ -128,44 +204,154 @@ public class AwContents {
         int super_getScrollBarStyle();
 
         /**
-         * Requests a callback on the native DrawGL method (see getAwDrawGLFunction)
-         * if called from within onDraw, |canvas| will be non-null and hardware accelerated.
-         * otherwise, |canvas| will be null, and the container view itself will be hardware
-         * accelerated.
+         * @see View#startActivityForResult(Intent, int)
+         */
+        void super_startActivityForResult(Intent intent, int requestCode);
+    }
+
+    /**
+     * Factory interface used for constructing functors that the Android framework uses for
+     * calling back into Chromium code to render the the contents of a Chromium frame into
+     * an Android view.
+     */
+    public interface NativeDrawGLFunctorFactory {
+        /**
+         * Create a functor associated with native context |context|.
+         */
+        NativeDrawGLFunctor createFunctor(long context);
+    }
+
+    /**
+     * Interface that consumers of {@link AwContents} must implement to support
+     * native GL rendering.
+     */
+    public interface NativeDrawGLFunctor {
+        /**
+         * Requests a callback on the native DrawGL method (see getAwDrawGLFunction).
+         *
+         * If called from within onDraw, |canvas| should be non-null and must be hardware
+         * accelerated. |releasedCallback| should be null if |canvas| is null, or if
+         * supportsDrawGLFunctorReleasedCallback returns false.
          *
          * @return false indicates the GL draw request was not accepted, and the caller
          *         should fallback to the SW path.
          */
-        boolean requestDrawGL(Canvas canvas);
+        boolean requestDrawGL(Canvas canvas, Runnable releasedCallback);
+
+        /**
+         * Requests a callback on the native DrawGL method (see getAwDrawGLFunction).
+         *
+         * |containerView| must be hardware accelerated. If |waitForCompletion| is true, this method
+         * will not return until functor has returned.
+         */
+        boolean requestInvokeGL(View containerView, boolean waitForCompletion);
+
+        /**
+         * Test whether the Android framework supports notifying when a functor is free
+         * to be destroyed via the callback mechanism provided to the functor factory.
+         *
+         * @return true if destruction needs to wait on a framework callback, or false
+         *         if it can occur immediately.
+         */
+        boolean supportsDrawGLFunctorReleasedCallback();
+
+        /**
+         * Detaches the GLFunctor from the view tree.
+         */
+        void detach(View containerView);
+
+        /**
+         * Get a Runnable that is used to destroy the native portion of the functor. After the
+         * run method of this Runnable is called, no other methods should be called on the Java
+         * object.
+         */
+        Runnable getDestroyRunnable();
+
+    }
+
+    /**
+     * Class to facilitate dependency injection. Subclasses by test code to provide mock versions of
+     * certain AwContents dependencies.
+     */
+    public static class DependencyFactory {
+        public AwLayoutSizer createLayoutSizer() {
+            return new AwLayoutSizer();
+        }
+
+        public AwScrollOffsetManager createScrollOffsetManager(
+                AwScrollOffsetManager.Delegate delegate) {
+            return new AwScrollOffsetManager(delegate);
+        }
+
+        public AutofillProvider createAutofillProvider(Context context, ViewGroup containerView) {
+            return null;
+        }
+    }
+
+    /**
+     * Visual state callback, see {@link #insertVisualStateCallback} for details.
+     *
+     */
+    @VisibleForTesting
+    public abstract static class VisualStateCallback {
+        /**
+         * @param requestId the id passed to {@link AwContents#insertVisualStateCallback}
+         * which can be used to match requests with the corresponding callbacks.
+         */
+        public abstract void onComplete(long requestId);
     }
 
     private long mNativeAwContents;
     private final AwBrowserContext mBrowserContext;
-    private final ViewGroup mContainerView;
+    // mContainerView and mCurrentFunctor form a pair that needs to stay in sync.
+    private ViewGroup mContainerView;
+    private AwGLFunctor mCurrentFunctor;
+    private AwGLFunctor mInitialFunctor;
+    private AwGLFunctor mFullScreenFunctor; // Only non-null when in fullscreen mode.
+    private final Context mContext;
+    private final int mAppTargetSdkVersion;
     private ContentViewCore mContentViewCore;
+    private AwViewAndroidDelegate mViewAndroidDelegate;
+    private WindowAndroidWrapper mWindowAndroid;
+    private WebContents mWebContents;
+    private NavigationController mNavigationController;
     private final AwContentsClient mContentsClient;
-    private final AwContentViewClient mContentViewClient;
+    private AwWebContentsObserver mWebContentsObserver;
     private final AwContentsClientBridge mContentsClientBridge;
-    private final AwWebContentsDelegate mWebContentsDelegate;
+    private final AwWebContentsDelegateAdapter mWebContentsDelegate;
+    private final AwContentsBackgroundThreadClient mBackgroundThreadClient;
     private final AwContentsIoThreadClient mIoThreadClient;
     private final InterceptNavigationDelegateImpl mInterceptNavigationDelegate;
-    private final InternalAccessDelegate mInternalAccessAdapter;
+    private InternalAccessDelegate mInternalAccessAdapter;
+    private final NativeDrawGLFunctorFactory mNativeDrawGLFunctorFactory;
     private final AwLayoutSizer mLayoutSizer;
     private final AwZoomControls mZoomControls;
     private final AwScrollOffsetManager mScrollOffsetManager;
     private OverScrollGlow mOverScrollGlow;
+    private final DisplayAndroidObserver mDisplayObserver;
     // This can be accessed on any thread after construction. See AwContentsIoThreadClient.
     private final AwSettings mSettings;
     private final ScrollAccessibilityHelper mScrollAccessibilityHelper;
+
+    private final ObserverList<PopupTouchHandleDrawable> mTouchHandleDrawables =
+            new ObserverList<>();
 
     private boolean mIsPaused;
     private boolean mIsViewVisible;
     private boolean mIsWindowVisible;
     private boolean mIsAttachedToWindow;
+    // Visiblity state of |mContentViewCore|.
+    private boolean mIsContentViewCoreVisible;
+    private boolean mIsUpdateVisibilityTaskPending;
+    private Runnable mUpdateVisibilityRunnable;
+
+    private @RendererPriority int mRendererPriority;
+    private boolean mRendererPriorityWaivedWhenNotVisible;
+
     private Bitmap mFavicon;
     private boolean mHasRequestedVisitedHistoryFromClient;
-    // TODO(boliu): This should be in a global context, not per webview.
-    private final double mDIPScale;
+    // Whether this WebView is a popup.
+    private boolean mIsPopupWindow;
 
     // The base background color, i.e. not accounting for any CSS body from the current page.
     private int mBaseBackgroundColor = Color.WHITE;
@@ -190,26 +376,145 @@ public class AwContents {
     private float mContentWidthDip;
     private float mContentHeightDip;
 
-    private AwAutofillManagerDelegate mAwAutofillManagerDelegate;
-
-    private ComponentCallbacks2 mComponentCallbacks;
+    private AwAutofillClient mAwAutofillClient;
 
     private AwPdfExporter mAwPdfExporter;
+
+    private AwViewMethods mAwViewMethods;
+    private final FullScreenTransitionsState mFullScreenTransitionsState;
 
     // This flag indicates that ShouldOverrideUrlNavigation should be posted
     // through the resourcethrottle. This is only used for popup windows.
     private boolean mDeferredShouldOverrideUrlLoadingIsPendingForPopup;
 
-    private static final class DestroyRunnable implements Runnable {
-        private final long mNativeAwContents;
-        private DestroyRunnable(long nativeAwContents) {
-            mNativeAwContents = nativeAwContents;
+    // This is a workaround for some qualcomm devices discarding buffer on
+    // Activity restore.
+    private boolean mInvalidateRootViewOnNextDraw;
+
+    // The framework may temporarily detach our container view, for example during layout if
+    // we are a child of a ListView. This may cause many toggles of View focus, which we suppress
+    // when in this state.
+    private boolean mTemporarilyDetached;
+
+    private Handler mHandler;
+
+    // True when this AwContents has been destroyed.
+    // Do not use directly, call isDestroyed() instead.
+    private boolean mIsDestroyed;
+
+    // True if this AwContents is in no operation state.
+    // Do not use directly, call isNoOperation() instead.
+    private boolean mIsNoOperation;
+
+    private AutofillProvider mAutofillProvider;
+
+    private static String sCurrentLocales = "";
+
+    private Paint mPaintForNWorkaround;
+
+    // A holder of objects passed from WebContents and should be owned by AwContents that may
+    // have direct or indirect reference back to WebView. They are used internally by
+    // WebContents but all the references can create a new gc root that can keep WebView
+    // instances from being freed when they are detached from view tree, hence lead to
+    // memory leak. To avoid the issue, it is possible to use |WebContents.setInternalHolder|
+    // to move the holder of those internal objects to AwContents. Note that they are still
+    // used by WebContents, and AwContents doesn't have to know what's inside the holder.
+    private WebContentsInternals mWebContentsInternals;
+
+    private JavascriptInjector mJavascriptInjector;
+
+    private static class WebContentsInternalsHolder implements WebContents.InternalsHolder {
+        private final WeakReference<AwContents> mAwContentsRef;
+
+        private WebContentsInternalsHolder(AwContents awContents) {
+            mAwContentsRef = new WeakReference<>(awContents);
         }
+
+        @Override
+        public void set(WebContentsInternals internals) {
+            AwContents awContents = mAwContentsRef.get();
+            if (awContents == null) {
+                throw new IllegalStateException("AwContents should be available at this time");
+            }
+            awContents.mWebContentsInternals = internals;
+        }
+
+        @Override
+        public WebContentsInternals get() {
+            AwContents awContents = mAwContentsRef.get();
+            return awContents == null ? null : awContents.mWebContentsInternals;
+        }
+    }
+
+    private static final class AwContentsDestroyRunnable implements Runnable {
+        private final long mNativeAwContents;
+        // Hold onto a reference to the window (via its wrapper), so that it is not destroyed
+        // until we are done here.
+        private final WindowAndroidWrapper mWindowAndroid;
+
+        private AwContentsDestroyRunnable(
+                long nativeAwContents, WindowAndroidWrapper windowAndroid) {
+            mNativeAwContents = nativeAwContents;
+            mWindowAndroid = windowAndroid;
+        }
+
         @Override
         public void run() {
-            // This is a no-op if not currently attached.
-            nativeOnDetachedFromWindow(mNativeAwContents);
             nativeDestroy(mNativeAwContents);
+        }
+    }
+
+    /**
+     * A class that stores the state needed to enter and exit fullscreen.
+     */
+    private static class FullScreenTransitionsState {
+        private final ViewGroup mInitialContainerView;
+        private final InternalAccessDelegate mInitialInternalAccessAdapter;
+        private final AwViewMethods mInitialAwViewMethods;
+        private FullScreenView mFullScreenView;
+        /** Whether the initial container view was focused when we entered fullscreen */
+        private boolean mWasInitialContainerViewFocused;
+
+        private FullScreenTransitionsState(ViewGroup initialContainerView,
+                InternalAccessDelegate initialInternalAccessAdapter,
+                AwViewMethods initialAwViewMethods) {
+            mInitialContainerView = initialContainerView;
+            mInitialInternalAccessAdapter = initialInternalAccessAdapter;
+            mInitialAwViewMethods = initialAwViewMethods;
+        }
+
+        private void enterFullScreen(FullScreenView fullScreenView,
+                boolean wasInitialContainerViewFocused) {
+            mFullScreenView = fullScreenView;
+            mWasInitialContainerViewFocused = wasInitialContainerViewFocused;
+        }
+
+        private boolean wasInitialContainerViewFocused() {
+            return mWasInitialContainerViewFocused;
+        }
+
+        private void exitFullScreen() {
+            mFullScreenView = null;
+        }
+
+        private boolean isFullScreen() {
+            return mFullScreenView != null;
+        }
+
+        private ViewGroup getInitialContainerView() {
+            return mInitialContainerView;
+        }
+
+        private InternalAccessDelegate getInitialInternalAccessDelegate() {
+            return mInitialInternalAccessAdapter;
+        }
+
+        private AwViewMethods getInitialAwViewMethods() {
+            return mInitialAwViewMethods;
+        }
+
+        private FullScreenView getFullScreenView() {
+            return mFullScreenView;
         }
     }
 
@@ -217,13 +522,8 @@ public class AwContents {
     // (ie before it is destroyed).
     private CleanupReference mCleanupReference;
 
-    // A list of references to native pointers where the Java counterpart has been
-    // destroyed, but are held here because they are waiting for onDetachFromWindow
-    // to release GL resources. This is cleared inside onDetachFromWindow.
-    private List<CleanupReference> mPendingDetachCleanupReferences;
-
     //--------------------------------------------------------------------------------------------
-    private class IoThreadClientImpl implements AwContentsIoThreadClient {
+    private class IoThreadClientImpl extends AwContentsIoThreadClient {
         // All methods are called on the IO thread.
 
         @Override
@@ -232,29 +532,8 @@ public class AwContents {
         }
 
         @Override
-        public InterceptedRequestData shouldInterceptRequest(final String url,
-                boolean isMainFrame) {
-            InterceptedRequestData interceptedRequestData;
-            // Return the response directly if the url is default video poster url.
-            interceptedRequestData = mDefaultVideoPosterRequestHandler.shouldInterceptRequest(url);
-            if (interceptedRequestData != null) return interceptedRequestData;
-
-            interceptedRequestData = mContentsClient.shouldInterceptRequest(url);
-
-            if (interceptedRequestData == null) {
-                mContentsClient.getCallbackHelper().postOnLoadResource(url);
-            }
-
-            if (isMainFrame && interceptedRequestData != null &&
-                    interceptedRequestData.getData() == null) {
-                // In this case the intercepted URLRequest job will simulate an empty response
-                // which doesn't trigger the onReceivedError callback. For WebViewClassic
-                // compatibility we synthesize that callback. http://crbug.com/180950
-                mContentsClient.getCallbackHelper().postOnReceivedError(
-                        ErrorCodeConversionHelper.ERROR_UNKNOWN,
-                        null /* filled in by the glue layer */, url);
-            }
-            return interceptedRequestData;
+        public AwContentsBackgroundThreadClient getBackgroundThreadClient() {
+            return mBackgroundThreadClient;
         }
 
         @Override
@@ -273,18 +552,44 @@ public class AwContents {
         }
 
         @Override
-        public void onDownloadStart(String url,
-                                    String userAgent,
-                                    String contentDisposition,
-                                    String mimeType,
-                                    long contentLength) {
-            mContentsClient.getCallbackHelper().postOnDownloadStart(url, userAgent,
-                    contentDisposition, mimeType, contentLength);
+        public boolean shouldAcceptThirdPartyCookies() {
+            return mSettings.getAcceptThirdPartyCookies();
         }
 
         @Override
-        public void newLoginRequest(String realm, String account, String args) {
-            mContentsClient.getCallbackHelper().postOnReceivedLoginRequest(realm, account, args);
+        public boolean getSafeBrowsingEnabled() {
+            return mSettings.getSafeBrowsingEnabled();
+        }
+    }
+
+    private class BackgroundThreadClientImpl extends AwContentsBackgroundThreadClient {
+        // All methods are called on the background thread.
+
+        @Override
+        public AwWebResourceResponse shouldInterceptRequest(
+                AwContentsClient.AwWebResourceRequest request) {
+            String url = request.url;
+            AwWebResourceResponse awWebResourceResponse;
+            // Return the response directly if the url is default video poster url.
+            awWebResourceResponse = mDefaultVideoPosterRequestHandler.shouldInterceptRequest(url);
+            if (awWebResourceResponse != null) return awWebResourceResponse;
+
+            awWebResourceResponse = mContentsClient.shouldInterceptRequest(request);
+
+            if (awWebResourceResponse == null) {
+                mContentsClient.getCallbackHelper().postOnLoadResource(url);
+            }
+
+            if (awWebResourceResponse != null && awWebResourceResponse.getData() == null) {
+                // In this case the intercepted URLRequest job will simulate an empty response
+                // which doesn't trigger the onReceivedError callback. For WebViewClassic
+                // compatibility we synthesize that callback.  http://crbug.com/180950
+                mContentsClient.getCallbackHelper().postOnReceivedError(
+                        request,
+                        /* error description filled in by the glue layer */
+                        new AwContentsClient.AwWebResourceError());
+            }
+            return awWebResourceResponse;
         }
     }
 
@@ -302,12 +607,19 @@ public class AwContents {
         public boolean shouldIgnoreNavigation(NavigationParams navigationParams) {
             final String url = navigationParams.url;
             boolean ignoreNavigation = false;
-            if (mDeferredShouldOverrideUrlLoadingIsPendingForPopup) {
+            // Disable old path for sending shouldoverrideurlloadings for popups when
+            // plznavigate is enabled. The callback will come through NavigatorRequest.
+            if (!BrowserSideNavigationPolicy.isBrowserSideNavigationEnabled()
+                    && mDeferredShouldOverrideUrlLoadingIsPendingForPopup) {
                 mDeferredShouldOverrideUrlLoadingIsPendingForPopup = false;
                 // If this is used for all navigations in future, cases for application initiated
                 // load, redirect and backforward should also be filtered out.
                 if (!navigationParams.isPost) {
-                    ignoreNavigation = mContentsClient.shouldOverrideUrlLoading(url);
+                    ignoreNavigation = mContentsClient.shouldIgnoreNavigation(
+                            mContext, url, navigationParams.isMainFrame,
+                            navigationParams.hasUserGesture
+                            || navigationParams.hasUserGestureCarryover,
+                            navigationParams.isRedirect);
                 }
             }
             // The shouldOverrideUrlLoading call might have resulted in posting messages to the
@@ -333,15 +645,15 @@ public class AwContents {
         }
 
         @Override
-        public void setFixedLayoutSize(int widthDip, int heightDip) {
-            if (mNativeAwContents == 0) return;
-            nativeSetFixedLayoutSize(mNativeAwContents, widthDip, heightDip);
+        public boolean isLayoutParamsHeightWrapContent() {
+            return mContainerView.getLayoutParams() != null
+                    && (mContainerView.getLayoutParams().height
+                            == ViewGroup.LayoutParams.WRAP_CONTENT);
         }
 
         @Override
-        public boolean isLayoutParamsHeightWrapContent() {
-            return mContainerView.getLayoutParams() != null &&
-                mContainerView.getLayoutParams().height == ViewGroup.LayoutParams.WRAP_CONTENT;
+        public void setForceZeroLayoutHeight(boolean forceZeroHeight) {
+            getSettings().setForceZeroLayoutHeight(forceZeroHeight);
         }
     }
 
@@ -361,8 +673,14 @@ public class AwContents {
 
         @Override
         public void scrollNativeTo(int x, int y) {
-            if (mNativeAwContents == 0) return;
-            nativeScrollTo(mNativeAwContents, x, y);
+            if (!isDestroyedOrNoOperation(NO_WARN)) nativeScrollTo(mNativeAwContents, x, y);
+        }
+
+        @Override
+        public void smoothScroll(int targetX, int targetY, long durationMs) {
+            if (!isDestroyedOrNoOperation(NO_WARN)) {
+                nativeSmoothScroll(mNativeAwContents, targetX, targetY, durationMs);
+            }
         }
 
         @Override
@@ -377,12 +695,17 @@ public class AwContents {
 
         @Override
         public void invalidate() {
-            mContainerView.invalidate();
+            postInvalidateOnAnimation();
+        }
+
+        @Override
+        public void cancelFling() {
+            mWebContents.getEventForwarder().cancelFling(SystemClock.uptimeMillis());
         }
     }
 
     //--------------------------------------------------------------------------------------------
-    private class AwGestureStateListener extends GestureStateListener {
+    private class AwGestureStateListener implements GestureStateListener {
         @Override
         public void onPinchStarted() {
             // While it's possible to re-layout the view during a pinch gesture, the effect is very
@@ -400,170 +723,466 @@ public class AwContents {
         }
 
         @Override
-        public void onFlingCancelGesture() {
-            mScrollOffsetManager.onFlingCancelGesture();
-        }
-
-        @Override
-        public void onUnhandledFlingStartEvent(int velocityX, int velocityY) {
-            mScrollOffsetManager.onUnhandledFlingStartEvent(velocityX, velocityY);
-        }
-
-        @Override
         public void onScrollUpdateGestureConsumed() {
             mScrollAccessibilityHelper.postViewScrolledAccessibilityEventCallback();
+            mZoomControls.invokeZoomPicker();
+        }
+
+        @Override
+        public void onScrollStarted(int scrollOffsetY, int scrollExtentY) {
+            mZoomControls.invokeZoomPicker();
+        }
+
+        @Override
+        public void onScaleLimitsChanged(float minPageScaleFactor, float maxPageScaleFactor) {
+            mZoomControls.updateZoomControls();
+        }
+
+        @Override
+        public void onScrollOffsetOrExtentChanged(int scrollOffsetY, int scrollExtentY) {
+            mZoomControls.updateZoomControls();
         }
     }
 
     //--------------------------------------------------------------------------------------------
     private class AwComponentCallbacks implements ComponentCallbacks2 {
         @Override
-        public void onTrimMemory(int level) {
-            if (mNativeAwContents == 0) return;
-            nativeTrimMemory(mNativeAwContents, level);
+        public void onTrimMemory(final int level) {
+            boolean visibleRectEmpty = getGlobalVisibleRect().isEmpty();
+            final boolean visible = mIsViewVisible && mIsWindowVisible && !visibleRectEmpty;
+            ThreadUtils.runOnUiThreadBlocking(() -> {
+                if (isDestroyedOrNoOperation(NO_WARN)) return;
+                if (level >= TRIM_MEMORY_MODERATE) {
+                    mInitialFunctor.deleteHardwareRenderer();
+                    if (mFullScreenFunctor != null) {
+                        mFullScreenFunctor.deleteHardwareRenderer();
+                    }
+                }
+                nativeTrimMemory(mNativeAwContents, level, visible);
+            });
         }
 
         @Override
         public void onLowMemory() {}
 
         @Override
-        public void onConfigurationChanged(Configuration configuration) {}
+        public void onConfigurationChanged(Configuration configuration) {
+            updateDefaultLocale();
+            mSettings.updateAcceptLanguages();
+        }
     };
 
     //--------------------------------------------------------------------------------------------
-    private class AwLayoutChangeListener implements View.OnLayoutChangeListener {
+    private class AwDisplayAndroidObserver implements DisplayAndroidObserver {
         @Override
-        public void onLayoutChange(View v, int left, int top, int right, int bottom,
-                int oldLeft, int oldTop, int oldRight, int oldBottom) {
-            assert v == mContainerView;
-            mLayoutSizer.onLayoutChange();
-        }
-    }
+        public void onRotationChanged(int rotation) {}
 
+        @Override
+        public void onDIPScaleChanged(float dipScale) {
+            if (TRACE) Log.i(TAG, "%s onDIPScaleChanged dipScale=%f", this, dipScale);
+
+            nativeSetDipScale(mNativeAwContents, dipScale);
+            mLayoutSizer.setDIPScale(dipScale);
+            mSettings.setDIPScale(dipScale);
+        }
+    };
+
+    //--------------------------------------------------------------------------------------------
     /**
      * @param browserContext the browsing context to associate this view contents with.
      * @param containerView the view-hierarchy item this object will be bound to.
+     * @param context the context to use, usually containerView.getContext().
      * @param internalAccessAdapter to access private methods on containerView.
+     * @param nativeGLDelegate to access the GL functor provided by the WebView.
      * @param contentsClient will receive API callbacks from this WebView Contents.
      * @param awSettings AwSettings instance used to configure the AwContents.
      *
      * This constructor uses the default view sizing policy.
      */
-    public AwContents(AwBrowserContext browserContext, ViewGroup containerView,
-            InternalAccessDelegate internalAccessAdapter, AwContentsClient contentsClient,
+    public AwContents(AwBrowserContext browserContext, ViewGroup containerView, Context context,
+            InternalAccessDelegate internalAccessAdapter,
+            NativeDrawGLFunctorFactory nativeDrawGLFunctorFactory, AwContentsClient contentsClient,
             AwSettings awSettings) {
-        this(browserContext, containerView, internalAccessAdapter, contentsClient, awSettings,
-                new AwLayoutSizer());
+        this(browserContext, containerView, context, internalAccessAdapter,
+                nativeDrawGLFunctorFactory, contentsClient, awSettings, new DependencyFactory());
     }
 
     /**
-     * @param layoutSizer the AwLayoutSizer instance implementing the sizing policy for the view.
+     * @param dependencyFactory an instance of the DependencyFactory used to provide instances of
+     *                          classes that this class depends on.
      *
      * This version of the constructor is used in test code to inject test versions of the above
      * documented classes.
      */
-    public AwContents(AwBrowserContext browserContext, ViewGroup containerView,
-            InternalAccessDelegate internalAccessAdapter, AwContentsClient contentsClient,
-            AwSettings settings, AwLayoutSizer layoutSizer) {
+    public AwContents(AwBrowserContext browserContext, ViewGroup containerView, Context context,
+            InternalAccessDelegate internalAccessAdapter,
+            NativeDrawGLFunctorFactory nativeDrawGLFunctorFactory, AwContentsClient contentsClient,
+            AwSettings settings, DependencyFactory dependencyFactory) {
+        mRendererPriority = RendererPriority.HIGH;
+        updateDefaultLocale();
+        settings.updateAcceptLanguages();
+
         mBrowserContext = browserContext;
+
+        // setWillNotDraw(false) is required since WebView draws it's own contents using it's
+        // container view. If this is ever not the case we should remove this, as it removes
+        // Android's gatherTransparentRegion optimization for the view.
         mContainerView = containerView;
+        mContainerView.setWillNotDraw(false);
+
+        mHandler = new Handler();
+        mContext = context;
+        mAutofillProvider = dependencyFactory.createAutofillProvider(context, mContainerView);
+        mAppTargetSdkVersion = mContext.getApplicationInfo().targetSdkVersion;
         mInternalAccessAdapter = internalAccessAdapter;
+        mNativeDrawGLFunctorFactory = nativeDrawGLFunctorFactory;
+        mInitialFunctor = new AwGLFunctor(mNativeDrawGLFunctorFactory, mContainerView);
+        mCurrentFunctor = mInitialFunctor;
         mContentsClient = contentsClient;
-        mContentViewClient = new AwContentViewClient(contentsClient, settings);
-        mLayoutSizer = layoutSizer;
+        mContentsClient.getCallbackHelper().setCancelCallbackPoller(
+                () -> AwContents.this.isDestroyedOrNoOperation(NO_WARN));
+        mAwViewMethods = new AwViewMethodsImpl();
+        mFullScreenTransitionsState = new FullScreenTransitionsState(
+                mContainerView, mInternalAccessAdapter, mAwViewMethods);
+        mLayoutSizer = dependencyFactory.createLayoutSizer();
         mSettings = settings;
-        mDIPScale = DeviceDisplayInfo.create(mContainerView.getContext()).getDIPScale();
         mLayoutSizer.setDelegate(new AwLayoutSizerDelegate());
-        mLayoutSizer.setDIPScale(mDIPScale);
-        mWebContentsDelegate = new AwWebContentsDelegateAdapter(contentsClient, mContainerView);
-        mContentsClientBridge = new AwContentsClientBridge(contentsClient);
+        mWebContentsDelegate = new AwWebContentsDelegateAdapter(
+                this, contentsClient, settings, mContext, mContainerView);
+        mContentsClientBridge = new AwContentsClientBridge(mContext, contentsClient,
+                AwContentsStatics.getClientCertLookupTable());
         mZoomControls = new AwZoomControls(this);
+        mBackgroundThreadClient = new BackgroundThreadClientImpl();
         mIoThreadClient = new IoThreadClientImpl();
         mInterceptNavigationDelegate = new InterceptNavigationDelegateImpl();
+        mDisplayObserver = new AwDisplayAndroidObserver();
+        mUpdateVisibilityRunnable = () -> updateContentViewCoreVisibility();
 
         AwSettings.ZoomSupportChangeListener zoomListener =
-                new AwSettings.ZoomSupportChangeListener() {
-                    @Override
-                    public void onGestureZoomSupportChanged(
-                            boolean supportsDoubleTapZoom, boolean supportsMultiTouchZoom) {
-                        mContentViewCore.updateDoubleTapSupport(supportsDoubleTapZoom);
-                        mContentViewCore.updateMultiTouchZoomSupport(supportsMultiTouchZoom);
-                    }
-
+                (supportsDoubleTapZoom, supportsMultiTouchZoom) -> {
+                    if (isDestroyedOrNoOperation(NO_WARN)) return;
+                    mContentViewCore.updateDoubleTapSupport(supportsDoubleTapZoom);
+                    mContentViewCore.updateMultiTouchZoomSupport(supportsMultiTouchZoom);
                 };
         mSettings.setZoomListener(zoomListener);
         mDefaultVideoPosterRequestHandler = new DefaultVideoPosterRequestHandler(mContentsClient);
         mSettings.setDefaultVideoPosterURL(
                 mDefaultVideoPosterRequestHandler.getDefaultVideoPosterURL());
-        mSettings.setDIPScale(mDIPScale);
-        mScrollOffsetManager = new AwScrollOffsetManager(new AwScrollOffsetManagerDelegate(),
-                new OverScroller(mContainerView.getContext()));
+        mScrollOffsetManager =
+                dependencyFactory.createScrollOffsetManager(new AwScrollOffsetManagerDelegate());
         mScrollAccessibilityHelper = new ScrollAccessibilityHelper(mContainerView);
 
         setOverScrollMode(mContainerView.getOverScrollMode());
         setScrollBarStyle(mInternalAccessAdapter.super_getScrollBarStyle());
-        mContainerView.addOnLayoutChangeListener(new AwLayoutChangeListener());
 
         setNewAwContents(nativeInit(mBrowserContext));
 
-        onVisibilityChanged(mContainerView, mContainerView.getVisibility());
-        onWindowVisibilityChanged(mContainerView.getWindowVisibility());
+        onContainerViewChanged();
     }
 
-    private static ContentViewCore createAndInitializeContentViewCore(ViewGroup containerView,
-            InternalAccessDelegate internalDispatcher, int nativeWebContents,
-            GestureStateListener gestureStateListener,
-            ContentViewClient contentViewClient,
-            ContentViewCore.ZoomControlsDelegate zoomControlsDelegate) {
-        Context context = containerView.getContext();
-        ContentViewCore contentViewCore = new ContentViewCore(context);
-        contentViewCore.initialize(containerView, internalDispatcher, nativeWebContents,
-                context instanceof Activity ?
-                        new ActivityWindowAndroid((Activity) context) :
-                        new WindowAndroid(context.getApplicationContext()));
-        contentViewCore.addGestureStateListener(gestureStateListener);
-        contentViewCore.setContentViewClient(contentViewClient);
-        contentViewCore.setZoomControlsDelegate(zoomControlsDelegate);
-        return contentViewCore;
+    private void initializeContentViewCore(ContentViewCore contentViewCore, Context context,
+            ViewAndroidDelegate viewDelegate, InternalAccessDelegate internalDispatcher,
+            WebContents webContents, WindowAndroid windowAndroid) {
+        contentViewCore.initialize(viewDelegate, internalDispatcher, webContents, windowAndroid);
+        SelectionPopupController controller = SelectionPopupController.fromWebContents(webContents);
+        controller.setActionModeCallback(
+                new AwActionModeCallback(mContext, this, controller.getActionModeCallbackHelper()));
+        if (mAutofillProvider != null) {
+            controller.setNonSelectionActionModeCallback(
+                    new AutofillActionModeCallback(context, mAutofillProvider));
+        }
+        controller.setSelectionClient(SelectionClient.createSmartSelectionClient(webContents));
+
+        // Listen for dpad events from IMEs (e.g. Samsung Cursor Control) so we know to enable
+        // spatial navigation mode to allow these events to move focus out of the WebView.
+        ImeAdapter.fromWebContents(webContents).addEventObserver(new ImeEventObserver() {
+            @Override
+            public void onBeforeSendKeyEvent(KeyEvent event) {
+                if (AwContents.isDpadEvent(event)) {
+                    mSettings.setSpatialNavigationEnabled(true);
+                }
+            }
+        });
+    }
+
+    boolean isFullScreen() {
+        return mFullScreenTransitionsState.isFullScreen();
     }
 
     /**
-     * Common initialization routine for adopting a native AwContents instance into this
+     * Transitions this {@link AwContents} to fullscreen mode and returns the
+     * {@link View} where the contents will be drawn while in fullscreen, or null
+     * if this AwContents has already been destroyed.
+     */
+    View enterFullScreen() {
+        assert !isFullScreen();
+        if (isDestroyedOrNoOperation(NO_WARN)) return null;
+
+        // Detach to tear down the GL functor if this is still associated with the old
+        // container view. It will be recreated during the next call to onDraw attached to
+        // the new container view.
+        onDetachedFromWindow();
+
+        // In fullscreen mode FullScreenView owns the AwViewMethodsImpl and AwContents
+        // a NullAwViewMethods.
+        FullScreenView fullScreenView = new FullScreenView(mContext, mAwViewMethods, this);
+        fullScreenView.setFocusable(true);
+        fullScreenView.setFocusableInTouchMode(true);
+        boolean wasInitialContainerViewFocused = mContainerView.isFocused();
+        if (wasInitialContainerViewFocused) {
+            fullScreenView.requestFocus();
+        }
+        mFullScreenFunctor = new AwGLFunctor(mNativeDrawGLFunctorFactory, fullScreenView);
+        mFullScreenTransitionsState.enterFullScreen(fullScreenView, wasInitialContainerViewFocused);
+        mAwViewMethods = new NullAwViewMethods(this, mInternalAccessAdapter, mContainerView);
+
+        // Associate this AwContents with the FullScreenView.
+        setInternalAccessAdapter(fullScreenView.getInternalAccessAdapter());
+        setContainerView(fullScreenView, mFullScreenFunctor);
+
+        return fullScreenView;
+    }
+
+    /**
+     * Called when the app has requested to exit fullscreen.
+     */
+    void requestExitFullscreen() {
+        if (!isDestroyedOrNoOperation(NO_WARN)) mContentViewCore.getWebContents().exitFullscreen();
+    }
+
+    /**
+     * Returns this {@link AwContents} to embedded mode, where the {@link AwContents} are drawn
+     * in the WebView.
+     */
+    void exitFullScreen() {
+        if (!isFullScreen() || isDestroyedOrNoOperation(NO_WARN)) {
+            // exitFullScreen() can be called without a prior call to enterFullScreen() if a
+            // "misbehave" app overrides onShowCustomView but does not add the custom view to
+            // the window. Exiting avoids a crash.
+            return;
+        }
+
+        // Detach to tear down the GL functor if this is still associated with the old
+        // container view. It will be recreated during the next call to onDraw attached to
+        // the new container view.
+        // NOTE: we cannot use mAwViewMethods here because its type is NullAwViewMethods.
+        AwViewMethods awViewMethodsImpl = mFullScreenTransitionsState.getInitialAwViewMethods();
+        awViewMethodsImpl.onDetachedFromWindow();
+
+        // Swap the view delegates. In embedded mode the FullScreenView owns a
+        // NullAwViewMethods and AwContents the AwViewMethodsImpl.
+        FullScreenView fullscreenView = mFullScreenTransitionsState.getFullScreenView();
+        fullscreenView.setAwViewMethods(new NullAwViewMethods(
+                this, fullscreenView.getInternalAccessAdapter(), fullscreenView));
+        mAwViewMethods = awViewMethodsImpl;
+        ViewGroup initialContainerView = mFullScreenTransitionsState.getInitialContainerView();
+
+        // Re-associate this AwContents with the WebView.
+        setInternalAccessAdapter(mFullScreenTransitionsState.getInitialInternalAccessDelegate());
+        setContainerView(initialContainerView, mInitialFunctor);
+
+        // Return focus to the WebView.
+        if (mFullScreenTransitionsState.wasInitialContainerViewFocused()) {
+            mContainerView.requestFocus();
+        }
+        mFullScreenTransitionsState.exitFullScreen();
+        // Drop AwContents last reference to this functor. AwGLFunctor is responsible for cleanup.
+        mFullScreenFunctor = null;
+    }
+
+    private void setInternalAccessAdapter(InternalAccessDelegate internalAccessAdapter) {
+        mInternalAccessAdapter = internalAccessAdapter;
+        mContentViewCore.setContainerViewInternals(mInternalAccessAdapter);
+    }
+
+    private void setContainerView(ViewGroup newContainerView, AwGLFunctor currentFunctor) {
+        // setWillNotDraw(false) is required since WebView draws it's own contents using it's
+        // container view. If this is ever not the case we should remove this, as it removes
+        // Android's gatherTransparentRegion optimization for the view.
+        mContainerView = newContainerView;
+        mCurrentFunctor = currentFunctor;
+        updateNativeAwGLFunctor();
+        mContainerView.setWillNotDraw(false);
+
+        mViewAndroidDelegate.updateCurrentContainerView(mContainerView,
+                mWindowAndroid.getWindowAndroid().getDisplay());
+        mContentViewCore.setContainerView(mContainerView);
+        if (mAwPdfExporter != null) {
+            mAwPdfExporter.setContainerView(mContainerView);
+        }
+        mWebContentsDelegate.setContainerView(mContainerView);
+        for (PopupTouchHandleDrawable drawable: mTouchHandleDrawables) {
+            drawable.onContainerViewChanged(newContainerView);
+        }
+        onContainerViewChanged();
+    }
+
+    /**
+     * Reconciles the state of this AwContents object with the state of the new container view.
+     */
+    @SuppressLint("NewApi") // ViewGroup#isAttachedToWindow requires API level 19.
+    private void onContainerViewChanged() {
+        // NOTE: mAwViewMethods is used by the old container view, the WebView, so it might refer
+        // to a NullAwViewMethods when in fullscreen. To ensure that the state is reconciled with
+        // the new container view correctly, we bypass mAwViewMethods and use the real
+        // implementation directly.
+        AwViewMethods awViewMethodsImpl = mFullScreenTransitionsState.getInitialAwViewMethods();
+        awViewMethodsImpl.onVisibilityChanged(mContainerView, mContainerView.getVisibility());
+        awViewMethodsImpl.onWindowVisibilityChanged(mContainerView.getWindowVisibility());
+
+        boolean containerViewAttached = mContainerView.isAttachedToWindow();
+        if (containerViewAttached && !mIsAttachedToWindow) {
+            awViewMethodsImpl.onAttachedToWindow();
+        } else if (!containerViewAttached && mIsAttachedToWindow) {
+            awViewMethodsImpl.onDetachedFromWindow();
+        }
+        awViewMethodsImpl.onSizeChanged(
+                mContainerView.getWidth(), mContainerView.getHeight(), 0, 0);
+        awViewMethodsImpl.onWindowFocusChanged(mContainerView.hasWindowFocus());
+        awViewMethodsImpl.onFocusChanged(mContainerView.hasFocus(), 0, null);
+        mContainerView.requestLayout();
+        if (mAutofillProvider != null) mAutofillProvider.onContainerViewChanged(mContainerView);
+    }
+
+    // This class destroys the WindowAndroid when after it is gc-ed.
+    private static class WindowAndroidWrapper {
+        private final WindowAndroid mWindowAndroid;
+        private final CleanupReference mCleanupReference;
+
+        private static final class DestroyRunnable implements Runnable {
+            private final WindowAndroid mWindowAndroid;
+            private DestroyRunnable(WindowAndroid windowAndroid) {
+                mWindowAndroid = windowAndroid;
+            }
+            @Override
+            public void run() {
+                mWindowAndroid.destroy();
+            }
+        }
+
+        public WindowAndroidWrapper(WindowAndroid windowAndroid) {
+            mWindowAndroid = windowAndroid;
+            mCleanupReference =
+                    new CleanupReference(this, new DestroyRunnable(windowAndroid));
+        }
+
+        public WindowAndroid getWindowAndroid() {
+            return mWindowAndroid;
+        }
+    }
+    private static WeakHashMap<Context, WindowAndroidWrapper> sContextWindowMap;
+
+    // getWindowAndroid is only called on UI thread, so there are no threading issues with lazy
+    // initialization.
+    private static WindowAndroidWrapper getWindowAndroid(Context context) {
+        if (sContextWindowMap == null) sContextWindowMap = new WeakHashMap<>();
+        WindowAndroidWrapper wrapper = sContextWindowMap.get(context);
+        if (wrapper != null) return wrapper;
+
+        boolean contextWrapsActivity = activityFromContext(context) != null;
+        if (contextWrapsActivity) {
+            final boolean listenToActivityState = false;
+            wrapper = new WindowAndroidWrapper(
+                    new ActivityWindowAndroid(context, listenToActivityState));
+        } else {
+            wrapper = new WindowAndroidWrapper(new WindowAndroid(context));
+        }
+        sContextWindowMap.put(context, wrapper);
+        return wrapper;
+    }
+
+    // Set current locales to native.
+    @VisibleForTesting
+    public static void updateDefaultLocale() {
+        String locales = LocaleUtils.getDefaultLocaleListString();
+        if (!sCurrentLocales.equals(locales)) {
+            sCurrentLocales = locales;
+
+            // We cannot use the first language in sCurrentLocales for the UI language even on
+            // Android N. LocaleUtils.getDefaultLocaleString() is capable for UI language but
+            // it is not guaranteed to be listed at the first of sCurrentLocales. Therefore,
+            // both values are passed to native.
+            nativeUpdateDefaultLocale(LocaleUtils.getDefaultLocaleString(), sCurrentLocales);
+        }
+    }
+
+    private void updateNativeAwGLFunctor() {
+        nativeSetAwGLFunctor(mNativeAwContents,
+                mCurrentFunctor != null ? mCurrentFunctor.getNativeAwGLFunctor() : 0);
+    }
+
+    /* Common initialization routine for adopting a native AwContents instance into this
      * java instance.
      *
      * TAKE CARE! This method can get called multiple times per java instance. Code accordingly.
      * ^^^^^^^^^  See the native class declaration for more details on relative object lifetimes.
      */
     private void setNewAwContents(long newAwContentsPtr) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
+            setNewAwContentsPreO(newAwContentsPtr);
+        } else {
+            // Move the TextClassifier to the new WebContents.
+            TextClassifier textClassifier = mWebContents != null ? getTextClassifier() : null;
+            setNewAwContentsPreO(newAwContentsPtr);
+            if (textClassifier != null) setTextClassifier(textClassifier);
+        }
+    }
+
+    // Helper for setNewAwContents containing everything which applies to pre-O.
+    private void setNewAwContentsPreO(long newAwContentsPtr) {
         if (mNativeAwContents != 0) {
-            destroy();
+            destroyNatives();
             mContentViewCore = null;
+            mWebContents = null;
+            mWebContentsInternals = null;
+            mNavigationController = null;
+            mJavascriptInjector = null;
         }
 
         assert mNativeAwContents == 0 && mCleanupReference == null && mContentViewCore == null;
 
         mNativeAwContents = newAwContentsPtr;
+        updateNativeAwGLFunctor();
         // TODO(joth): when the native and java counterparts of AwBrowserContext are hooked up to
         // each other, we should update |mBrowserContext| according to the newly received native
         // WebContent's browser context.
 
+        WebContents webContents = nativeGetWebContents(mNativeAwContents);
+
+        mWindowAndroid = getWindowAndroid(mContext);
+
+        mContentViewCore = ContentViewCore.create(mContext, PRODUCT_VERSION);
+        mViewAndroidDelegate =
+                new AwViewAndroidDelegate(mContainerView, mContentsClient, mScrollOffsetManager);
+        initializeContentViewCore(mContentViewCore, mContext, mViewAndroidDelegate,
+                mInternalAccessAdapter, webContents, mWindowAndroid.getWindowAndroid());
+        nativeSetJavaPeers(mNativeAwContents, this, mWebContentsDelegate, mContentsClientBridge,
+                mIoThreadClient, mInterceptNavigationDelegate, mAutofillProvider);
+        mWebContents = mContentViewCore.getWebContents();
+        mWebContents.setInternalsHolder(new WebContentsInternalsHolder(this));
+        GestureListenerManager.fromWebContents(mWebContents)
+                .addListener(new AwGestureStateListener());
+
+        mNavigationController = mWebContents.getNavigationController();
+        installWebContentsObserver();
+        mSettings.setWebContents(webContents);
+        if (mAutofillProvider != null) mAutofillProvider.setWebContents(webContents);
+
+        mDisplayObserver.onDIPScaleChanged(getDeviceScaleFactor());
+
+        updateContentViewCoreVisibility();
+
         // The native side object has been bound to this java instance, so now is the time to
         // bind all the native->java relationships.
-        mCleanupReference = new CleanupReference(this, new DestroyRunnable(mNativeAwContents));
+        mCleanupReference = new CleanupReference(
+                this, new AwContentsDestroyRunnable(mNativeAwContents, mWindowAndroid));
+    }
 
-        int nativeWebContents = nativeGetWebContents(mNativeAwContents);
-        mContentViewCore = createAndInitializeContentViewCore(
-                mContainerView, mInternalAccessAdapter, nativeWebContents,
-                new AwGestureStateListener(), mContentViewClient, mZoomControls);
-        nativeSetJavaPeers(mNativeAwContents, this, mWebContentsDelegate, mContentsClientBridge,
-                mIoThreadClient, mInterceptNavigationDelegate);
-        mContentsClient.installWebContentsObserver(mContentViewCore);
-        mSettings.setWebContents(nativeWebContents);
-        nativeSetDipScale(mNativeAwContents, (float) mDIPScale);
-        updateGlobalVisibleRect();
-
-        // The only call to onShow. onHide should never be called.
-        mContentViewCore.onShow();
+    private void installWebContentsObserver() {
+        if (mWebContentsObserver != null) {
+            mWebContentsObserver.destroy();
+        }
+        mWebContentsObserver = new AwWebContentsObserver(mWebContents, this, mContentsClient);
     }
 
     /**
@@ -571,7 +1190,8 @@ public class AwContents {
      * provide the AwContents to host the pop up content.
      */
     public void supplyContentsForPopup(AwContents newContents) {
-        int popupNativeAwContents = nativeReleasePopupAwContents(mNativeAwContents);
+        if (isDestroyedOrNoOperation(WARN)) return;
+        long popupNativeAwContents = nativeReleasePopupAwContents(mNativeAwContents);
         if (popupNativeAwContents == 0) {
             Log.w(TAG, "Popup WebView bind failed: no pending content.");
             if (newContents != null) newContents.destroy();
@@ -587,7 +1207,8 @@ public class AwContents {
 
     // Recap: supplyContentsForPopup() is called on the parent window's content, this method is
     // called on the popup window's content.
-    private void receivePopupContents(int popupNativeAwContents) {
+    private void receivePopupContents(long popupNativeAwContents) {
+        if (isDestroyedOrNoOperation(WARN)) return;
         mDeferredShouldOverrideUrlLoadingIsPendingForPopup = true;
         // Save existing view state.
         final boolean wasAttached = mIsAttachedToWindow;
@@ -602,59 +1223,171 @@ public class AwContents {
         if (wasWindowFocused) onWindowFocusChanged(false);
         if (wasViewVisible) setViewVisibilityInternal(false);
         if (wasWindowVisible) setWindowVisibilityInternal(false);
+        if (wasAttached) onDetachedFromWindow();
         if (!wasPaused) onPause();
-        // Not calling onDetachedFromWindow here because native code requires GL context to release
-        // GL resources. This case is properly handled when destroy is called while still attached
-        // to window.
+
+        // Save injected JavaScript interfaces.
+        Map<String, Pair<Object, Class>> javascriptInterfaces =
+                new HashMap<String, Pair<Object, Class>>();
+        if (mContentViewCore != null) {
+            javascriptInterfaces.putAll(getJavascriptInjector().getInterfaces());
+        }
 
         setNewAwContents(popupNativeAwContents);
+        // We defer loading any URL on the popup until it has been properly intialized (through
+        // setNewAwContents). We resume the load here.
+        nativeResumeLoadingCreatedPopupWebContents(mNativeAwContents);
 
         // Finally refresh all view state for mContentViewCore and mNativeAwContents.
         if (!wasPaused) onResume();
-        if (wasAttached) onAttachedToWindow();
+        if (wasAttached) {
+            onAttachedToWindow();
+            postInvalidateOnAnimation();
+        }
         onSizeChanged(mContainerView.getWidth(), mContainerView.getHeight(), 0, 0);
         if (wasWindowVisible) setWindowVisibilityInternal(true);
         if (wasViewVisible) setViewVisibilityInternal(true);
         if (wasWindowFocused) onWindowFocusChanged(wasWindowFocused);
         if (wasFocused) onFocusChanged(true, 0, null);
+
+        mIsPopupWindow = true;
+
+        // Restore injected JavaScript interfaces.
+        for (Map.Entry<String, Pair<Object, Class>> entry : javascriptInterfaces.entrySet()) {
+            @SuppressWarnings("unchecked")
+            Class<? extends Annotation> requiredAnnotation = entry.getValue().second;
+            getJavascriptInjector().addPossiblyUnsafeInterface(
+                    entry.getValue().first, entry.getKey(), requiredAnnotation);
+        }
+    }
+
+    private JavascriptInjector getJavascriptInjector() {
+        if (mJavascriptInjector == null) {
+            mJavascriptInjector = JavascriptInjector.fromWebContents(mWebContents);
+        }
+        return mJavascriptInjector;
+    }
+
+    @VisibleForTesting
+    @CalledByNative
+    protected void onRenderProcessGone(int childProcessID) {
+        // This is the first callback we got for render process gone, we can't destroy the WebView
+        // now because we need to get next callback onRenderProcessGoneWithDetail() to know whether
+        // render process crashed or was killed.
+        // However, we should make WebView no operation to avoid being in weird states.
+        // TODO: We might be able to combine destroyed and no operation states.
+        mIsNoOperation = true;
+    }
+
+    @VisibleForTesting
+    @CalledByNative
+    protected boolean onRenderProcessGoneDetail(int childProcessID, boolean crashed) {
+        if (isDestroyed(NO_WARN)) return true;
+        return mContentsClient.onRenderProcessGone(new AwRenderProcessGoneDetail(
+                crashed, nativeGetEffectivePriority(mNativeAwContents)));
+    }
+
+    @VisibleForTesting
+    public @RendererPriority int getEffectivePriorityForTesting() {
+        assert !isDestroyed(NO_WARN);
+        return nativeGetEffectivePriority(mNativeAwContents);
+    }
+
+    private boolean isNoOperation() {
+        return mIsNoOperation;
+    }
+
+    private boolean isDestroyedOrNoOperation(int warnIfDestroyed) {
+        return isDestroyed(warnIfDestroyed) || isNoOperation();
     }
 
     /**
-     * Deletes the native counterpart of this object. Normally happens immediately,
-     * but maybe deferred until the appropriate time for GL resource cleanup. Either way
-     * this is transparent to the caller: after this function returns the object is
-     * effectively dead and methods are no-ops.
+     * Destroys this object and deletes its native counterpart.
      */
     public void destroy() {
-        if (mCleanupReference != null) {
-            // We explicitly do not null out the mContentViewCore reference here
-            // because ContentViewCore already has code to deal with the case
-            // methods are called on it after it's been destroyed, and other
-            // code relies on AwContents.mContentViewCore to be non-null.
-            mContentViewCore.destroy();
-            mNativeAwContents = 0;
+        if (TRACE) Log.i(TAG, "%s destroy", this);
+        if (isDestroyed(NO_WARN)) return;
 
-            // We cannot destroy immediately if we are still attached to the window.
-            // Instead if we make sure to null out the native pointer so there is no more native
-            // calls, and delay the actual destroy until onDetachedFromWindow.
-            if (mIsAttachedToWindow) {
-                if (mPendingDetachCleanupReferences == null) {
-                    mPendingDetachCleanupReferences = new ArrayList<CleanupReference>();
-                }
-                mPendingDetachCleanupReferences.add(mCleanupReference);
-            } else {
-                mCleanupReference.cleanupNow();
-            }
+        // Remove pending messages
+        mContentsClient.getCallbackHelper().removeCallbacksAndMessages();
+
+        if (mIsAttachedToWindow) {
+            Log.w(TAG, "WebView.destroy() called while WebView is still attached to window.");
+            // Need to call detach to avoid leaks because the real detach later will be ignored.
+            onDetachedFromWindow();
+        }
+        mIsNoOperation = true;
+        mIsDestroyed = true;
+        mHandler.post(() -> destroyNatives());
+    }
+
+    /**
+     * Deletes the native counterpart of this object.
+     */
+    private void destroyNatives() {
+        if (mCleanupReference != null) {
+            assert mNativeAwContents != 0;
+
+            mWebContentsObserver.destroy();
+            mWebContentsObserver = null;
+            mContentViewCore.destroy();
+            mContentViewCore = null;
+            mNativeAwContents = 0;
+            mWebContents = null;
+            mWebContentsInternals = null;
+            mNavigationController = null;
+
+            mCleanupReference.cleanupNow();
             mCleanupReference = null;
         }
 
-        assert !mContentViewCore.isAlive();
+        assert mContentViewCore == null;
+        assert mWebContents == null;
+        assert mNavigationController == null;
         assert mNativeAwContents == 0;
+
+        onDestroyed();
+    }
+
+    @VisibleForTesting
+    protected void onDestroyed() {}
+
+    /**
+     * Returns whether this instance of WebView is flagged as destroyed.
+     * If {@link WARN} is passed as a parameter, the method also issues a warning
+     * log message and dumps stack, as embedders are advised not to call any
+     * methods on destroyed WebViews.
+     *
+     * @param warnIfDestroyed use {@link WARN} if the check is done from a method
+     * that is called via public WebView API, and {@link NO_WARN} otherwise.
+     * @return whether this instance of WebView is flagged as destroyed.
+     */
+    private boolean isDestroyed(int warnIfDestroyed) {
+        if (mIsDestroyed && warnIfDestroyed == WARN) {
+            Log.w(TAG, "Application attempted to call on a destroyed WebView", new Throwable());
+        }
+        boolean destroyRunnableHasRun =
+                mCleanupReference != null && mCleanupReference.hasCleanedUp();
+        if (TRACE && destroyRunnableHasRun && !mIsDestroyed) {
+            // Swallow the error. App developers are not going to do anything with an error msg.
+            Log.d(TAG, "AwContents is kept alive past CleanupReference by finalizer");
+        }
+        return mIsDestroyed || destroyRunnableHasRun;
     }
 
     @VisibleForTesting
     public ContentViewCore getContentViewCore() {
         return mContentViewCore;
+    }
+
+    @VisibleForTesting
+    public WebContents getWebContents() {
+        return mWebContents;
+    }
+
+    @VisibleForTesting
+    public NavigationController getNavigationController() {
+        return mNavigationController;
     }
 
     // Can be called from any thread.
@@ -663,10 +1396,7 @@ public class AwContents {
     }
 
     public AwPdfExporter getPdfExporter() {
-        // mNativeAwContents can be null, due to destroy().
-        if (mNativeAwContents == 0) {
-            return null;
-        }
+        if (isDestroyedOrNoOperation(WARN)) return null;
         if (mAwPdfExporter == null) {
             mAwPdfExporter = new AwPdfExporter(mContainerView);
             nativeCreatePdfExporter(mNativeAwContents, mAwPdfExporter);
@@ -674,20 +1404,35 @@ public class AwContents {
         return mAwPdfExporter;
     }
 
-    public static void setAwDrawSWFunctionTable(int functionTablePointer) {
+    public static void setAwDrawSWFunctionTable(long functionTablePointer) {
         nativeSetAwDrawSWFunctionTable(functionTablePointer);
     }
 
-    public static void setAwDrawGLFunctionTable(int functionTablePointer) {
+    public static void setAwDrawGLFunctionTable(long functionTablePointer) {
         nativeSetAwDrawGLFunctionTable(functionTablePointer);
     }
 
-    public static int getAwDrawGLFunction() {
-        return nativeGetAwDrawGLFunction();
+    public static long getAwDrawGLFunction() {
+        return AwGLFunctor.getAwDrawGLFunction();
     }
 
     public static void setShouldDownloadFavicons() {
         nativeSetShouldDownloadFavicons();
+    }
+
+    public static Activity activityFromContext(Context context) {
+        return WindowAndroid.activityFromContext(context);
+    }
+    /**
+     * Disables contents of JS-to-Java bridge objects to be inspectable using
+     * Object.keys() method and "for .. in" loops. This is intended for applications
+     * targeting earlier Android releases where this was not possible, and we want
+     * to ensure backwards compatible behavior.
+     */
+    public void disableJavascriptInterfacesInspection() {
+        if (!isDestroyedOrNoOperation(WARN)) {
+            getJavascriptInjector().setAllowInspection(false);
+        }
     }
 
     /**
@@ -699,86 +1444,59 @@ public class AwContents {
         return nativeGetNativeInstanceCount();
     }
 
-    public int getAwDrawGLViewContext() {
-        // Only called during early construction, so client should not have had a chance to
-        // call destroy yet.
-        assert mNativeAwContents != 0;
-
-        // Using the native pointer as the returned viewContext. This is matched by the
-        // reinterpret_cast back to BrowserViewRenderer pointer in the native DrawGLFunction.
-        return nativeGetAwDrawGLViewContext(mNativeAwContents);
-    }
-
-    // This is only to avoid heap allocations inside updateGLobalVisibleRect. It should treated
+    // This is only to avoid heap allocations inside getGlobalVisibleRect. It should treated
     // as a local variable in the function and not used anywhere else.
     private static final Rect sLocalGlobalVisibleRect = new Rect();
 
-    @CalledByNative
-    private void updateGlobalVisibleRect() {
-        if (mNativeAwContents == 0) return;
+    private Rect getGlobalVisibleRect() {
         if (!mContainerView.getGlobalVisibleRect(sLocalGlobalVisibleRect)) {
             sLocalGlobalVisibleRect.setEmpty();
         }
-
-        nativeSetGlobalVisibleRect(mNativeAwContents, sLocalGlobalVisibleRect.left,
-                sLocalGlobalVisibleRect.top, sLocalGlobalVisibleRect.right,
-                sLocalGlobalVisibleRect.bottom);
+        return sLocalGlobalVisibleRect;
     }
 
     //--------------------------------------------------------------------------------------------
     //  WebView[Provider] method implementations (where not provided by ContentViewCore)
     //--------------------------------------------------------------------------------------------
 
-    // Only valid within onDraw().
-    private final Rect mClipBoundsTemporary = new Rect();
-
     public void onDraw(Canvas canvas) {
-        if (mNativeAwContents == 0) {
-            canvas.drawColor(getEffectiveBackgroundColor());
-            return;
+        try {
+            TraceEvent.begin("AwContents.onDraw");
+            mAwViewMethods.onDraw(canvas);
+        } finally {
+            TraceEvent.end("AwContents.onDraw");
         }
+    }
 
-        mScrollOffsetManager.syncScrollOffsetFromOnDraw();
-        canvas.getClipBounds(mClipBoundsTemporary);
-
-        if (!nativeOnDraw(mNativeAwContents, canvas, canvas.isHardwareAccelerated(),
-                mContainerView.getScrollX(), mContainerView.getScrollY(),
-                mClipBoundsTemporary.left, mClipBoundsTemporary.top,
-                mClipBoundsTemporary.right, mClipBoundsTemporary.bottom)) {
-            // Can happen during initialization when compositor is not set up. Or when clearView
-            // is in effect. Just draw background color instead.
-            canvas.drawColor(getEffectiveBackgroundColor());
-        }
-
-        if (mOverScrollGlow != null && mOverScrollGlow.drawEdgeGlows(canvas,
-                    mScrollOffsetManager.computeMaximumHorizontalScrollOffset(),
-                    mScrollOffsetManager.computeMaximumVerticalScrollOffset())) {
-            mContainerView.invalidate();
-        }
+    public void setLayoutParams(final ViewGroup.LayoutParams layoutParams) {
+        mLayoutSizer.onLayoutParamsChange();
     }
 
     public void onMeasure(int widthMeasureSpec, int heightMeasureSpec) {
-        mLayoutSizer.onMeasure(widthMeasureSpec, heightMeasureSpec);
+        mAwViewMethods.onMeasure(widthMeasureSpec, heightMeasureSpec);
     }
 
     public int getContentHeightCss() {
+        if (isDestroyedOrNoOperation(WARN)) return 0;
         return (int) Math.ceil(mContentHeightDip);
     }
 
     public int getContentWidthCss() {
+        if (isDestroyedOrNoOperation(WARN)) return 0;
         return (int) Math.ceil(mContentWidthDip);
     }
 
     public Picture capturePicture() {
-        if (mNativeAwContents == 0) return null;
+        if (TRACE) Log.i(TAG, "%s capturePicture", this);
+        if (isDestroyedOrNoOperation(WARN)) return null;
         return new AwPicture(nativeCapturePicture(mNativeAwContents,
-                    mScrollOffsetManager.computeHorizontalScrollRange(),
-                    mScrollOffsetManager.computeVerticalScrollRange()));
+                mScrollOffsetManager.computeHorizontalScrollRange(),
+                mScrollOffsetManager.computeVerticalScrollRange()));
     }
 
     public void clearView() {
-        if (mNativeAwContents == 0) return;
-        nativeClearView(mNativeAwContents);
+        if (TRACE) Log.i(TAG, "%s clearView", this);
+        if (!isDestroyedOrNoOperation(WARN)) nativeClearView(mNativeAwContents);
     }
 
     /**
@@ -787,61 +1505,203 @@ public class AwContents {
      * @param invalidationOnly Flag to call back only on invalidation without providing a picture.
      */
     public void enableOnNewPicture(boolean enabled, boolean invalidationOnly) {
-        if (mNativeAwContents == 0) return;
+        if (TRACE) Log.i(TAG, "%s enableOnNewPicture=%s", this, enabled);
+        if (isDestroyedOrNoOperation(WARN)) return;
         if (invalidationOnly) {
             mPictureListenerContentProvider = null;
         } else if (enabled && mPictureListenerContentProvider == null) {
-            mPictureListenerContentProvider = new Callable<Picture>() {
-                @Override
-                public Picture call() {
-                    return capturePicture();
-                }
-            };
+            mPictureListenerContentProvider = () -> capturePicture();
         }
         nativeEnableOnNewPicture(mNativeAwContents, enabled);
     }
 
     public void findAllAsync(String searchString) {
-        if (mNativeAwContents == 0) return;
-        nativeFindAllAsync(mNativeAwContents, searchString);
+        if (TRACE) Log.i(TAG, "%s findAllAsync", this);
+        if (!isDestroyedOrNoOperation(WARN)) nativeFindAllAsync(mNativeAwContents, searchString);
     }
 
     public void findNext(boolean forward) {
-        if (mNativeAwContents == 0) return;
-        nativeFindNext(mNativeAwContents, forward);
+        if (TRACE) Log.i(TAG, "%s findNext", this);
+        if (!isDestroyedOrNoOperation(WARN)) nativeFindNext(mNativeAwContents, forward);
     }
 
     public void clearMatches() {
-        if (mNativeAwContents == 0) return;
-        nativeClearMatches(mNativeAwContents);
+        if (TRACE) Log.i(TAG, "%s clearMatches", this);
+        if (!isDestroyedOrNoOperation(WARN)) nativeClearMatches(mNativeAwContents);
     }
 
     /**
      * @return load progress of the WebContents.
      */
     public int getMostRecentProgress() {
+        if (isDestroyedOrNoOperation(WARN)) return 0;
         // WebContentsDelegateAndroid conveniently caches the most recent notified value for us.
         return mWebContentsDelegate.getMostRecentProgress();
     }
 
     public Bitmap getFavicon() {
+        if (isDestroyedOrNoOperation(WARN)) return null;
         return mFavicon;
     }
 
     private void requestVisitedHistoryFromClient() {
-        ValueCallback<String[]> callback = new ValueCallback<String[]>() {
-            @Override
-            public void onReceiveValue(final String[] value) {
-                ThreadUtils.runOnUiThread(new Runnable() {
-                    @Override
-                    public void run() {
-                        if (mNativeAwContents == 0) return;
-                        nativeAddVisitedLinks(mNativeAwContents, value);
-                    }
-                });
+        Callback<String[]> callback = value -> {
+            if (value != null) {
+                // Replace null values with empty strings, because they can't be represented as
+                // native strings.
+                for (int i = 0; i < value.length; i++) {
+                    if (value[i] == null) value[i] = "";
+                }
             }
+
+            ThreadUtils.runOnUiThread(() -> {
+                if (!isDestroyedOrNoOperation(NO_WARN)) {
+                    nativeAddVisitedLinks(mNativeAwContents, value);
+                }
+            });
         };
         mContentsClient.getVisitedHistory(callback);
+    }
+
+    /**
+     * WebView.loadUrl.
+     */
+    public void loadUrl(String url, Map<String, String> additionalHttpHeaders) {
+        if (TRACE) Log.i(TAG, "%s loadUrl(extra headers)=%s", this, url);
+        if (isDestroyedOrNoOperation(WARN)) return;
+        // TODO: We may actually want to do some sanity checks here (like filter about://chrome).
+
+        // For backwards compatibility, apps targeting less than K will have JS URLs evaluated
+        // directly and any result of the evaluation will not replace the current page content.
+        // Matching Chrome behavior more closely; apps targetting >= K that load a JS URL will
+        // have the result of that URL replace the content of the current page.
+        final String javaScriptScheme = "javascript:";
+        if (mAppTargetSdkVersion < Build.VERSION_CODES.KITKAT && url != null
+                && url.startsWith(javaScriptScheme)) {
+            evaluateJavaScript(url.substring(javaScriptScheme.length()), null);
+            return;
+        }
+
+        LoadUrlParams params = new LoadUrlParams(url);
+        if (additionalHttpHeaders != null) {
+            params.setExtraHeaders(new HashMap<String, String>(additionalHttpHeaders));
+        }
+        loadUrl(params);
+    }
+
+    /**
+     * WebView.loadUrl.
+     */
+    public void loadUrl(String url) {
+        if (TRACE) Log.i(TAG, "%s loadUrl=%s", this, url);
+        if (isDestroyedOrNoOperation(WARN)) return;
+        // Early out to match old WebView implementation
+        if (url == null) {
+            return;
+        }
+        loadUrl(url, null);
+    }
+
+    /**
+     * WebView.postUrl.
+     */
+    public void postUrl(String url, byte[] postData) {
+        if (TRACE) Log.i(TAG, "%s postUrl=%s", this, url);
+        if (isDestroyedOrNoOperation(WARN)) return;
+        LoadUrlParams params = LoadUrlParams.createLoadHttpPostParams(url, postData);
+        Map<String, String> headers = new HashMap<String, String>();
+        headers.put("Content-Type", "application/x-www-form-urlencoded");
+        params.setExtraHeaders(headers);
+        loadUrl(params);
+    }
+
+    private static String fixupMimeType(String mimeType) {
+        return TextUtils.isEmpty(mimeType) ? "text/html" : mimeType;
+    }
+
+    private static String fixupData(String data) {
+        return TextUtils.isEmpty(data) ? "" : data;
+    }
+
+    private static String fixupBase(String url) {
+        return TextUtils.isEmpty(url) ? ContentUrlConstants.ABOUT_BLANK_DISPLAY_URL : url;
+    }
+
+    private static String fixupHistory(String url) {
+        return TextUtils.isEmpty(url) ? ContentUrlConstants.ABOUT_BLANK_DISPLAY_URL : url;
+    }
+
+    private static boolean isBase64Encoded(String encoding) {
+        return "base64".equals(encoding);
+    }
+
+    private static void recordHistoryUrl(@HistoryUrl int value) {
+        RecordHistogram.recordEnumeratedHistogram(
+                "WebView.LoadDataWithBaseUrl.HistoryUrl", value, HistoryUrl.COUNT);
+    }
+
+    /**
+     * WebView.loadData.
+     */
+    public void loadData(String data, String mimeType, String encoding) {
+        if (TRACE) Log.i(TAG, "%s loadData", this);
+        if (isDestroyedOrNoOperation(WARN)) return;
+        loadUrl(LoadUrlParams.createLoadDataParams(
+                fixupData(data), fixupMimeType(mimeType), isBase64Encoded(encoding)));
+    }
+
+    /**
+     * WebView.loadDataWithBaseURL.
+     */
+    public void loadDataWithBaseURL(
+            String baseUrl, String data, String mimeType, String encoding, String historyUrl) {
+        if (TRACE) Log.i(TAG, "%s loadDataWithBaseURL=%s", this, baseUrl);
+        if (isDestroyedOrNoOperation(WARN)) return;
+
+        data = fixupData(data);
+        mimeType = fixupMimeType(mimeType);
+        LoadUrlParams loadUrlParams;
+        baseUrl = fixupBase(baseUrl);
+        historyUrl = fixupHistory(historyUrl);
+
+        if (historyUrl.equals(ContentUrlConstants.ABOUT_BLANK_DISPLAY_URL)) {
+            recordHistoryUrl(HistoryUrl.EMPTY);
+        } else if (historyUrl.equals(baseUrl)) {
+            recordHistoryUrl(HistoryUrl.BASEURL);
+        } else {
+            recordHistoryUrl(HistoryUrl.DIFFERENT);
+        }
+
+        if (baseUrl.startsWith("data:")) {
+            // For backwards compatibility with WebViewClassic, we use the value of |encoding|
+            // as the charset, as long as it's not "base64".
+            boolean isBase64 = isBase64Encoded(encoding);
+            loadUrlParams = LoadUrlParams.createLoadDataParamsWithBaseUrl(
+                    data, mimeType, isBase64, baseUrl, historyUrl, isBase64 ? null : encoding);
+        } else {
+            // When loading data with a non-data: base URL, the classic WebView would effectively
+            // "dump" that string of data into the WebView without going through regular URL
+            // loading steps such as decoding URL-encoded entities. We achieve this same behavior by
+            // base64 encoding the data that is passed here and then loading that as a data: URL.
+            try {
+                loadUrlParams = LoadUrlParams.createLoadDataParamsWithBaseUrl(
+                        Base64.encodeToString(data.getBytes("utf-8"), Base64.DEFAULT), mimeType,
+                        true, baseUrl, historyUrl, "utf-8");
+            } catch (java.io.UnsupportedEncodingException e) {
+                Log.wtf(TAG, "Unable to load data string %s", data, e);
+                return;
+            }
+        }
+
+        // This is a workaround for an issue with PlzNavigate and one of Samsung's OEM mail apps.
+        // See http://crbug.com/781535.
+        if (SAMSUNG_WORKAROUND_PACKAGE_NAME.equals(mContext.getPackageName())
+                && SAMSUNG_WORKAROUND_BASE_URL.equals(loadUrlParams.getBaseUrl())) {
+            ThreadUtils.postOnUiThreadDelayed(
+                    () -> loadUrl(loadUrlParams), SAMSUNG_WORKAROUND_DELAY);
+            return;
+        }
+        loadUrl(loadUrlParams);
     }
 
     /**
@@ -851,37 +1711,51 @@ public class AwContents {
      *
      * @param params Parameters for this load.
      */
+    @VisibleForTesting
     public void loadUrl(LoadUrlParams params) {
-        if (params.getLoadUrlType() == LoadUrlParams.LOAD_TYPE_DATA &&
-                !params.isBaseUrlDataScheme()) {
+        if (params.getLoadUrlType() == LoadURLType.DATA && !params.isBaseUrlDataScheme()) {
             // This allows data URLs with a non-data base URL access to file:///android_asset/ and
             // file:///android_res/ URLs. If AwSettings.getAllowFileAccess permits, it will also
             // allow access to file:// URLs (subject to OS level permission checks).
             params.setCanLoadLocalResources(true);
+            nativeGrantFileSchemeAccesstoChildProcess(mNativeAwContents);
         }
 
         // If we are reloading the same url, then set transition type as reload.
-        if (params.getUrl() != null &&
-                params.getUrl().equals(mContentViewCore.getUrl()) &&
-                params.getTransitionType() == PageTransitionTypes.PAGE_TRANSITION_LINK) {
-                params.setTransitionType(PageTransitionTypes.PAGE_TRANSITION_RELOAD);
+        if (params.getUrl() != null && params.getUrl().equals(mWebContents.getLastCommittedUrl())
+                && params.getTransitionType() == PageTransition.LINK) {
+            params.setTransitionType(PageTransition.RELOAD);
         }
         params.setTransitionType(
-                params.getTransitionType() | PageTransitionTypes.PAGE_TRANSITION_FROM_API);
+                params.getTransitionType() | PageTransition.FROM_API);
 
         // For WebView, always use the user agent override, which is set
         // every time the user agent in AwSettings is modified.
-        params.setOverrideUserAgent(LoadUrlParams.UA_OVERRIDE_TRUE);
+        params.setOverrideUserAgent(UserAgentOverrideOption.TRUE);
+
 
         // We don't pass extra headers to the content layer, as WebViewClassic
         // was adding them in a very narrow set of conditions. See http://crbug.com/306873
-        if (mNativeAwContents != 0) {
-            nativeSetExtraHeadersForUrl(
-                    mNativeAwContents, params.getUrl(), params.getExtraHttpRequestHeadersString());
+        // However, if the embedder is attempting to inject a Referer header for their
+        // loadUrl call, then we set that separately and remove it from the extra headers map/
+        final String referer = "referer";
+        Map<String, String> extraHeaders = params.getExtraHeaders();
+        if (extraHeaders != null) {
+            for (String header : extraHeaders.keySet()) {
+                if (referer.equals(header.toLowerCase(Locale.US))) {
+                    params.setReferrer(new Referrer(extraHeaders.remove(header),
+                            WebReferrerPolicy.DEFAULT));
+                    params.setExtraHeaders(extraHeaders);
+                    break;
+                }
+            }
         }
+
+        nativeSetExtraHeadersForUrl(
+                mNativeAwContents, params.getUrl(), params.getExtraHttpRequestHeadersString());
         params.setExtraHeaders(new HashMap<String, String>());
 
-        mContentViewCore.loadUrl(params);
+        mNavigationController.loadUrl(params);
 
         // The behavior of WebViewClassic uses the populateVisitedLinks callback in WebKit.
         // Chromium does not use this use code path and the best emulation of this behavior to call
@@ -891,8 +1765,8 @@ public class AwContents {
             requestVisitedHistoryFromClient();
         }
 
-        if (params.getLoadUrlType() == LoadUrlParams.LOAD_TYPE_DATA &&
-                params.getBaseUrl() != null) {
+        if (!BrowserSideNavigationPolicy.isBrowserSideNavigationEnabled()
+                && params.getLoadUrlType() == LoadURLType.DATA && params.getBaseUrl() != null) {
             // Data loads with a base url will be resolved in Blink, and not cause an onPageStarted
             // event to be sent. Sending the callback directly from here.
             mContentsClient.getCallbackHelper().postOnPageStarted(params.getBaseUrl());
@@ -900,33 +1774,54 @@ public class AwContents {
     }
 
     /**
-     * Get the URL of the current page.
+     * Get the URL of the current page. This is the visible URL of the {@link WebContents} which may
+     * be a pending navigation or the last committed URL. For the last committed URL use
+     * #getLastCommittedUrl().
      *
      * @return The URL of the current page or null if it's empty.
      */
     public String getUrl() {
-        String url =  mContentViewCore.getUrl();
+        if (isDestroyedOrNoOperation(WARN)) return null;
+        String url = mWebContents.getVisibleUrl();
+        if (url == null || url.trim().isEmpty()) return null;
+        return url;
+    }
+
+    /**
+     * Gets the last committed URL. It represents the current page that is
+     * displayed in WebContents. It represents the current security context.
+     *
+     * @return The URL of the current page or null if it's empty.
+     */
+    public String getLastCommittedUrl() {
+        if (isDestroyedOrNoOperation(NO_WARN)) return null;
+        String url = mWebContents.getLastCommittedUrl();
         if (url == null || url.trim().isEmpty()) return null;
         return url;
     }
 
     public void requestFocus() {
-        if (mNativeAwContents == 0) return;
-        if (!mContainerView.isInTouchMode() && mSettings.shouldFocusFirstNode()) {
-            nativeFocusFirstNode(mNativeAwContents);
-        }
+        mAwViewMethods.requestFocus();
     }
 
     public void setBackgroundColor(int color) {
         mBaseBackgroundColor = color;
-        if (mNativeAwContents != 0) nativeSetBackgroundColor(mNativeAwContents, color);
+        if (!isDestroyedOrNoOperation(WARN)) nativeSetBackgroundColor(mNativeAwContents, color);
     }
 
-    private int getEffectiveBackgroundColor() {
+    /**
+     * @see android.view.View#setLayerType()
+     */
+    public void setLayerType(int layerType, Paint paint) {
+        mAwViewMethods.setLayerType(layerType, paint);
+    }
+
+    int getEffectiveBackgroundColor() {
         // Do not ask the ContentViewCore for the background color, as it will always
         // report white prior to initial navigation or post destruction,  whereas we want
         // to use the client supplied base value in those cases.
-        if (mNativeAwContents == 0 || !mContentsClient.isCachedRendererBackgroundColorValid()) {
+        if (isDestroyedOrNoOperation(NO_WARN)
+                || !mContentsClient.isCachedRendererBackgroundColorValid()) {
             return mBaseBackgroundColor;
         }
         return mContentsClient.getCachedRendererBackgroundColor();
@@ -941,18 +1836,11 @@ public class AwContents {
     }
 
     /**
-     * @see ContentViewCore#getContentSettings()
-     */
-    public ContentSettings getContentSettings() {
-        return mContentViewCore.getContentSettings();
-    }
-
-    /**
      * @see View#setOverScrollMode(int)
      */
     public void setOverScrollMode(int mode) {
         if (mode != View.OVER_SCROLL_NEVER) {
-            mOverScrollGlow = new OverScrollGlow(mContainerView);
+            mOverScrollGlow = new OverScrollGlow(mContext, mContainerView);
         } else {
             mOverScrollGlow = null;
         }
@@ -964,7 +1852,7 @@ public class AwContents {
     // take that into consideration).
     // http://crbug.com/269032
     private boolean mOverlayHorizontalScrollbar = true;
-    private boolean mOverlayVerticalScrollbar = false;
+    private boolean mOverlayVerticalScrollbar;
 
     /**
      * @see View#setScrollBarStyle(int)
@@ -982,6 +1870,7 @@ public class AwContents {
      * @see View#setHorizontalScrollbarOverlay(boolean)
      */
     public void setHorizontalScrollbarOverlay(boolean overlay) {
+        if (TRACE) Log.i(TAG, "%s setHorizontalScrollbarOverlay=%s", this, overlay);
         mOverlayHorizontalScrollbar = overlay;
     }
 
@@ -989,6 +1878,7 @@ public class AwContents {
      * @see View#setVerticalScrollbarOverlay(boolean)
      */
     public void setVerticalScrollbarOverlay(boolean overlay) {
+        if (TRACE) Log.i(TAG, "%s setVerticalScrollbarOverlay=%s", this, overlay);
         mOverlayVerticalScrollbar = overlay;
     }
 
@@ -1011,11 +1901,7 @@ public class AwContents {
      * @see View#onScrollChanged(int,int)
      */
     public void onContainerViewScrollChanged(int l, int t, int oldl, int oldt) {
-        // A side-effect of View.onScrollChanged is that the scroll accessibility event being sent
-        // by the base class implementation. This is completely hidden from the base classes and
-        // cannot be prevented, which is why we need the code below.
-        mScrollAccessibilityHelper.removePostedViewScrolledAccessibilityEventCallback();
-        mScrollOffsetManager.onContainerViewScrollChanged(l, t);
+        mAwViewMethods.onContainerViewScrollChanged(l, t, oldl, oldt);
     }
 
     /**
@@ -1024,201 +1910,206 @@ public class AwContents {
      */
     public void onContainerViewOverScrolled(int scrollX, int scrollY, boolean clampedX,
             boolean clampedY) {
-        int oldX = mContainerView.getScrollX();
-        int oldY = mContainerView.getScrollY();
-
-        mScrollOffsetManager.onContainerViewOverScrolled(scrollX, scrollY, clampedX, clampedY);
-
-        if (mOverScrollGlow != null) {
-            mOverScrollGlow.pullGlow(mContainerView.getScrollX(), mContainerView.getScrollY(),
-                    oldX, oldY,
-                    mScrollOffsetManager.computeMaximumHorizontalScrollOffset(),
-                    mScrollOffsetManager.computeMaximumVerticalScrollOffset());
-        }
+        mAwViewMethods.onContainerViewOverScrolled(scrollX, scrollY, clampedX, clampedY);
     }
 
     /**
      * @see android.webkit.WebView#requestChildRectangleOnScreen(View, Rect, boolean)
      */
     public boolean requestChildRectangleOnScreen(View child, Rect rect, boolean immediate) {
+        if (isDestroyedOrNoOperation(WARN)) return false;
         return mScrollOffsetManager.requestChildRectangleOnScreen(
                 child.getLeft() - child.getScrollX(), child.getTop() - child.getScrollY(),
                 rect, immediate);
     }
 
     /**
-     * @see View.computeScroll()
-     */
-    public void computeScroll() {
-        mScrollOffsetManager.computeScrollAndAbsorbGlow(mOverScrollGlow);
-    }
-
-    /**
      * @see View#computeHorizontalScrollRange()
      */
     public int computeHorizontalScrollRange() {
-        return mScrollOffsetManager.computeHorizontalScrollRange();
+        return mAwViewMethods.computeHorizontalScrollRange();
     }
 
     /**
      * @see View#computeHorizontalScrollOffset()
      */
     public int computeHorizontalScrollOffset() {
-        return mScrollOffsetManager.computeHorizontalScrollOffset();
+        return mAwViewMethods.computeHorizontalScrollOffset();
     }
 
     /**
      * @see View#computeVerticalScrollRange()
      */
     public int computeVerticalScrollRange() {
-        return mScrollOffsetManager.computeVerticalScrollRange();
+        return mAwViewMethods.computeVerticalScrollRange();
     }
 
     /**
      * @see View#computeVerticalScrollOffset()
      */
     public int computeVerticalScrollOffset() {
-        return mScrollOffsetManager.computeVerticalScrollOffset();
+        return mAwViewMethods.computeVerticalScrollOffset();
     }
 
     /**
      * @see View#computeVerticalScrollExtent()
      */
     public int computeVerticalScrollExtent() {
-        return mScrollOffsetManager.computeVerticalScrollExtent();
+        return mAwViewMethods.computeVerticalScrollExtent();
+    }
+
+    /**
+     * @see View.computeScroll()
+     */
+    public void computeScroll() {
+        mAwViewMethods.computeScroll();
+    }
+
+    /**
+     * @see View#onCheckIsTextEditor()
+     */
+    public boolean onCheckIsTextEditor() {
+        return mAwViewMethods.onCheckIsTextEditor();
     }
 
     /**
      * @see android.webkit.WebView#stopLoading()
      */
     public void stopLoading() {
-        mContentViewCore.stopLoading();
+        if (TRACE) Log.i(TAG, "%s stopLoading", this);
+        if (!isDestroyedOrNoOperation(WARN)) mWebContents.stop();
     }
 
     /**
      * @see android.webkit.WebView#reload()
      */
     public void reload() {
-        mContentViewCore.reload(true);
+        if (TRACE) Log.i(TAG, "%s reload", this);
+        if (!isDestroyedOrNoOperation(WARN)) mNavigationController.reload(true);
     }
 
     /**
      * @see android.webkit.WebView#canGoBack()
      */
     public boolean canGoBack() {
-        return mContentViewCore.canGoBack();
+        return isDestroyedOrNoOperation(WARN) ? false : mNavigationController.canGoBack();
     }
 
     /**
      * @see android.webkit.WebView#goBack()
      */
     public void goBack() {
-        mContentViewCore.goBack();
+        if (TRACE) Log.i(TAG, "%s goBack", this);
+        if (!isDestroyedOrNoOperation(WARN)) mNavigationController.goBack();
     }
 
     /**
      * @see android.webkit.WebView#canGoForward()
      */
     public boolean canGoForward() {
-        return mContentViewCore.canGoForward();
+        return isDestroyedOrNoOperation(WARN) ? false : mNavigationController.canGoForward();
     }
 
     /**
      * @see android.webkit.WebView#goForward()
      */
     public void goForward() {
-        mContentViewCore.goForward();
+        if (TRACE) Log.i(TAG, "%s goForward", this);
+        if (!isDestroyedOrNoOperation(WARN)) mNavigationController.goForward();
     }
 
     /**
      * @see android.webkit.WebView#canGoBackOrForward(int)
      */
     public boolean canGoBackOrForward(int steps) {
-        return mContentViewCore.canGoToOffset(steps);
+        return isDestroyedOrNoOperation(WARN) ? false : mNavigationController.canGoToOffset(steps);
     }
 
     /**
      * @see android.webkit.WebView#goBackOrForward(int)
      */
     public void goBackOrForward(int steps) {
-        mContentViewCore.goToOffset(steps);
+        if (TRACE) Log.i(TAG, "%s goBackOrForwad=%d", this, steps);
+        if (!isDestroyedOrNoOperation(WARN)) mNavigationController.goToOffset(steps);
     }
 
     /**
      * @see android.webkit.WebView#pauseTimers()
      */
     public void pauseTimers() {
-        ContentViewStatics.setWebKitSharedTimersSuspended(true);
+        if (TRACE) Log.i(TAG, "%s pauseTimers", this);
+        if (!isDestroyedOrNoOperation(WARN)) {
+            ContentViewStatics.setWebKitSharedTimersSuspended(true);
+        }
     }
 
     /**
      * @see android.webkit.WebView#resumeTimers()
      */
     public void resumeTimers() {
-        ContentViewStatics.setWebKitSharedTimersSuspended(false);
+        if (TRACE) Log.i(TAG, "%s resumeTimers", this);
+        if (!isDestroyedOrNoOperation(WARN)) {
+            ContentViewStatics.setWebKitSharedTimersSuspended(false);
+        }
     }
 
     /**
      * @see android.webkit.WebView#onPause()
      */
     public void onPause() {
-        if (mIsPaused || mNativeAwContents == 0) return;
+        if (TRACE) Log.i(TAG, "%s onPause", this);
+        if (mIsPaused || isDestroyedOrNoOperation(NO_WARN)) return;
         mIsPaused = true;
         nativeSetIsPaused(mNativeAwContents, mIsPaused);
+
+        // Geolocation is paused/resumed via the page visibility mechanism.
+        updateContentViewCoreVisibility();
     }
 
     /**
      * @see android.webkit.WebView#onResume()
      */
     public void onResume() {
-        if (!mIsPaused || mNativeAwContents == 0) return;
+        if (TRACE) Log.i(TAG, "%s onResume", this);
+        if (!mIsPaused || isDestroyedOrNoOperation(NO_WARN)) return;
         mIsPaused = false;
         nativeSetIsPaused(mNativeAwContents, mIsPaused);
+        updateContentViewCoreVisibility();
     }
 
     /**
      * @see android.webkit.WebView#isPaused()
      */
     public boolean isPaused() {
-        return mIsPaused;
+        return isDestroyedOrNoOperation(WARN) ? false : mIsPaused;
     }
 
     /**
      * @see android.webkit.WebView#onCreateInputConnection(EditorInfo)
      */
     public InputConnection onCreateInputConnection(EditorInfo outAttrs) {
-        return mContentViewCore.onCreateInputConnection(outAttrs);
+        return mAwViewMethods.onCreateInputConnection(outAttrs);
+    }
+
+    /**
+     * @see android.webkit.WebView#onDragEvent(DragEvent)
+     */
+    public boolean onDragEvent(DragEvent event) {
+        return mAwViewMethods.onDragEvent(event);
     }
 
     /**
      * @see android.webkit.WebView#onKeyUp(int, KeyEvent)
      */
     public boolean onKeyUp(int keyCode, KeyEvent event) {
-        return mContentViewCore.onKeyUp(keyCode, event);
-    }
-
-    private boolean isDpadEvent(KeyEvent event) {
-        if (event.getAction() == KeyEvent.ACTION_DOWN) {
-            switch (event.getKeyCode()) {
-                case KeyEvent.KEYCODE_DPAD_CENTER:
-                case KeyEvent.KEYCODE_DPAD_DOWN:
-                case KeyEvent.KEYCODE_DPAD_UP:
-                case KeyEvent.KEYCODE_DPAD_LEFT:
-                case KeyEvent.KEYCODE_DPAD_RIGHT:
-                    return true;
-            }
-        }
-        return false;
+        return mAwViewMethods.onKeyUp(keyCode, event);
     }
 
     /**
      * @see android.webkit.WebView#dispatchKeyEvent(KeyEvent)
      */
     public boolean dispatchKeyEvent(KeyEvent event) {
-        if (isDpadEvent(event)) {
-            mSettings.setSpatialNavigationEnabled(true);
-        }
-        return mContentViewCore.dispatchKeyEvent(event);
+        return mAwViewMethods.dispatchKeyEvent(event);
     }
 
     /**
@@ -1228,17 +2119,27 @@ public class AwContents {
      * @param includeDiskFiles if false, only the RAM cache is cleared
      */
     public void clearCache(boolean includeDiskFiles) {
-        if (mNativeAwContents == 0) return;
-        nativeClearCache(mNativeAwContents, includeDiskFiles);
+        if (TRACE) Log.i(TAG, "%s clearCache", this);
+        if (!isDestroyedOrNoOperation(WARN)) nativeClearCache(mNativeAwContents, includeDiskFiles);
+    }
+
+    @VisibleForTesting
+    public void killRenderProcess() {
+        if (TRACE) Log.i(TAG, "%s killRenderProcess", this);
+        if (isDestroyedOrNoOperation(WARN)) {
+            throw new IllegalStateException("killRenderProcess() shouldn't be invoked after render"
+                    + " process is gone or webview is destroyed");
+        }
+        nativeKillRenderProcess(mNativeAwContents);
     }
 
     public void documentHasImages(Message message) {
-        if (mNativeAwContents == 0) return;
-        nativeDocumentHasImages(mNativeAwContents, message);
+        if (!isDestroyedOrNoOperation(WARN)) nativeDocumentHasImages(mNativeAwContents, message);
     }
 
     public void saveWebArchive(
-            final String basename, boolean autoname, final ValueCallback<String> callback) {
+            final String basename, boolean autoname, final Callback<String> callback) {
+        if (TRACE) Log.i(TAG, "%s saveWebArchive=%s", this, basename);
         if (!autoname) {
             saveWebArchiveInternal(basename, callback);
             return;
@@ -1255,11 +2156,12 @@ public class AwContents {
             protected void onPostExecute(String result) {
                 saveWebArchiveInternal(result, callback);
             }
-        }.execute();
+        }.executeOnExecutor(AsyncTask.THREAD_POOL_EXECUTOR);
     }
 
     public String getOriginalUrl() {
-        NavigationHistory history = mContentViewCore.getNavigationHistory();
+        if (isDestroyedOrNoOperation(WARN)) return null;
+        NavigationHistory history = mNavigationController.getNavigationHistory();
         int currentIndex = history.getCurrentEntryIndex();
         if (currentIndex >= 0 && currentIndex < history.getEntryCount()) {
             return history.getEntryAtIndex(currentIndex).getOriginalUrl();
@@ -1268,50 +2170,41 @@ public class AwContents {
     }
 
     /**
-     * @see ContentViewCore#getNavigationHistory()
+     * @see NavigationController#getNavigationHistory()
      */
     public NavigationHistory getNavigationHistory() {
-        return mContentViewCore.getNavigationHistory();
+        return isDestroyedOrNoOperation(WARN) ? null : mNavigationController.getNavigationHistory();
     }
 
     /**
      * @see android.webkit.WebView#getTitle()
      */
     public String getTitle() {
-        return mContentViewCore.getTitle();
+        return isDestroyedOrNoOperation(WARN) ? null : mWebContents.getTitle();
     }
 
     /**
      * @see android.webkit.WebView#clearHistory()
      */
     public void clearHistory() {
-        mContentViewCore.clearHistory();
-    }
-
-    public String[] getHttpAuthUsernamePassword(String host, String realm) {
-        return mBrowserContext.getHttpAuthDatabase(mContentViewCore.getContext())
-                .getHttpAuthUsernamePassword(host, realm);
-    }
-
-    public void setHttpAuthUsernamePassword(String host, String realm, String username,
-            String password) {
-        mBrowserContext.getHttpAuthDatabase(mContentViewCore.getContext())
-                .setHttpAuthUsernamePassword(host, realm, username, password);
+        if (TRACE) Log.i(TAG, "%s clearHistory", this);
+        if (!isDestroyedOrNoOperation(WARN)) mNavigationController.clearHistory();
     }
 
     /**
      * @see android.webkit.WebView#getCertificate()
      */
     public SslCertificate getCertificate() {
-        if (mNativeAwContents == 0) return null;
-        return SslUtil.getCertificateFromDerBytes(nativeGetCertificate(mNativeAwContents));
+        return isDestroyedOrNoOperation(WARN) ? null
+                : SslUtil.getCertificateFromDerBytes(nativeGetCertificate(mNativeAwContents));
     }
 
     /**
      * @see android.webkit.WebView#clearSslPreferences()
      */
     public void clearSslPreferences() {
-        mContentViewCore.clearSslPreferences();
+        if (TRACE) Log.i(TAG, "%s clearSslPreferences", this);
+        if (!isDestroyedOrNoOperation(WARN)) mNavigationController.clearSslPreferences();
     }
 
     /**
@@ -1321,7 +2214,8 @@ public class AwContents {
      * garbage allocation on repeated calls.
      */
     public HitTestData getLastHitTestResult() {
-        if (mNativeAwContents == 0) return null;
+        if (TRACE) Log.i(TAG, "%s getLastHitTestResult", this);
+        if (isDestroyedOrNoOperation(WARN)) return null;
         nativeUpdateLastHitTestData(mNativeAwContents);
         return mPossiblyStaleHitTestData;
     }
@@ -1330,7 +2224,8 @@ public class AwContents {
      * @see android.webkit.WebView#requestFocusNodeHref()
      */
     public void requestFocusNodeHref(Message msg) {
-        if (msg == null || mNativeAwContents == 0) return;
+        if (TRACE) Log.i(TAG, "%s requestFocusNodeHref", this);
+        if (msg == null || isDestroyedOrNoOperation(WARN)) return;
 
         nativeUpdateLastHitTestData(mNativeAwContents);
         Bundle data = msg.getData();
@@ -1349,7 +2244,8 @@ public class AwContents {
      * @see android.webkit.WebView#requestImageRef()
      */
     public void requestImageRef(Message msg) {
-        if (msg == null || mNativeAwContents == 0) return;
+        if (TRACE) Log.i(TAG, "%s requestImageRef", this);
+        if (msg == null || isDestroyedOrNoOperation(WARN)) return;
 
         nativeUpdateLastHitTestData(mNativeAwContents);
         Bundle data = msg.getData();
@@ -1363,6 +2259,10 @@ public class AwContents {
         return mPageScaleFactor;
     }
 
+    private float getDeviceScaleFactor() {
+        return mWindowAndroid.getWindowAndroid().getDisplay().getDipScale();
+    }
+
     /**
      * @see android.webkit.WebView#getScale()
      *
@@ -1370,20 +2270,26 @@ public class AwContents {
      * the screen density factor. See CTS WebViewTest.testSetInitialScale.
      */
     public float getScale() {
-        return (float)(mPageScaleFactor * mDIPScale);
+        if (isDestroyedOrNoOperation(WARN)) return 1;
+        return mPageScaleFactor * getDeviceScaleFactor();
     }
 
     /**
      * @see android.webkit.WebView#flingScroll(int, int)
      */
     public void flingScroll(int velocityX, int velocityY) {
-        mScrollOffsetManager.flingScroll(velocityX, velocityY);
+        if (TRACE) Log.i(TAG, "%s flingScroll", this);
+        if (isDestroyedOrNoOperation(WARN)) return;
+        mWebContents.getEventForwarder().startFling(
+                SystemClock.uptimeMillis(), -velocityX, -velocityY, false);
     }
 
     /**
      * @see android.webkit.WebView#pageUp(boolean)
      */
     public boolean pageUp(boolean top) {
+        if (TRACE) Log.i(TAG, "%s pageUp", this);
+        if (isDestroyedOrNoOperation(WARN)) return false;
         return mScrollOffsetManager.pageUp(top);
     }
 
@@ -1391,6 +2297,8 @@ public class AwContents {
      * @see android.webkit.WebView#pageDown(boolean)
      */
     public boolean pageDown(boolean bottom) {
+        if (TRACE) Log.i(TAG, "%s pageDown", this);
+        if (isDestroyedOrNoOperation(WARN)) return false;
         return mScrollOffsetManager.pageDown(bottom);
     }
 
@@ -1400,6 +2308,7 @@ public class AwContents {
     // This method uses the term 'zoom' for legacy reasons, but relates
     // to what chrome calls the 'page scale factor'.
     public boolean canZoomIn() {
+        if (isDestroyedOrNoOperation(WARN)) return false;
         final float zoomInExtent = mMaxPageScaleFactor - mPageScaleFactor;
         return zoomInExtent > ZOOM_CONTROLS_EPSILON;
     }
@@ -1410,6 +2319,7 @@ public class AwContents {
     // This method uses the term 'zoom' for legacy reasons, but relates
     // to what chrome calls the 'page scale factor'.
     public boolean canZoomOut() {
+        if (isDestroyedOrNoOperation(WARN)) return false;
         final float zoomOutExtent = mPageScaleFactor - mMinPageScaleFactor;
         return zoomOutExtent > ZOOM_CONTROLS_EPSILON;
     }
@@ -1423,7 +2333,8 @@ public class AwContents {
         if (!canZoomIn()) {
             return false;
         }
-        return mContentViewCore.pinchByDelta(1.25f);
+        zoomBy(1.25f);
+        return true;
     }
 
     /**
@@ -1435,202 +2346,322 @@ public class AwContents {
         if (!canZoomOut()) {
             return false;
         }
-        return mContentViewCore.pinchByDelta(0.8f);
+        zoomBy(0.8f);
+        return true;
+    }
+
+    /**
+     * @see android.webkit.WebView#zoomBy()
+     */
+    // This method uses the term 'zoom' for legacy reasons, but relates
+    // to what chrome calls the 'page scale factor'.
+    public void zoomBy(float delta) {
+        if (isDestroyedOrNoOperation(WARN)) return;
+        if (delta < 0.01f || delta > 100.0f) {
+            throw new IllegalStateException("zoom delta value outside [0.01, 100] range.");
+        }
+        nativeZoomBy(mNativeAwContents, delta);
     }
 
     /**
      * @see android.webkit.WebView#invokeZoomPicker()
      */
     public void invokeZoomPicker() {
-        mContentViewCore.invokeZoomPicker();
+        if (TRACE) Log.i(TAG, "%s invokeZoomPicker", this);
+        if (!isDestroyedOrNoOperation(WARN)) mZoomControls.invokeZoomPicker();
     }
 
     /**
-     * @see ContentViewCore.evaluateJavaScript(String, ContentViewCore.JavaScriptCallback)
+     * @see android.webkit.WebView#preauthorizePermission(Uri, long)
      */
-    public void evaluateJavaScript(String script, final ValueCallback<String> callback) {
-        ContentViewCore.JavaScriptCallback jsCallback = null;
+    public void preauthorizePermission(Uri origin, long resources) {
+        if (isDestroyedOrNoOperation(NO_WARN)) return;
+        nativePreauthorizePermission(mNativeAwContents, origin.toString(), resources);
+    }
+
+    /**
+     * @see ContentViewCore.evaluateJavaScript(String, JavaScriptCallback)
+     */
+    public void evaluateJavaScript(String script, final Callback<String> callback) {
+        if (TRACE) Log.i(TAG, "%s evaluateJavascript=%s", this, script);
+        if (isDestroyedOrNoOperation(WARN)) return;
+        JavaScriptCallback jsCallback = null;
         if (callback != null) {
-            jsCallback = new ContentViewCore.JavaScriptCallback() {
-                @Override
-                public void handleJavaScriptResult(String jsonResult) {
-                    callback.onReceiveValue(jsonResult);
-                }
+            jsCallback = jsonResult -> {
+                // Post the application callback back to the current thread to ensure the
+                // application callback is executed without any native code on the stack. This
+                // so that any exception thrown by the application callback won't have to be
+                // propagated through a native call stack.
+                mHandler.post(() -> callback.onResult(jsonResult));
             };
         }
 
-        mContentViewCore.evaluateJavaScript(script, jsCallback);
+        mWebContents.evaluateJavaScript(script, jsCallback);
+    }
+
+    public void evaluateJavaScriptForTests(String script, final Callback<String> callback) {
+        if (TRACE) Log.i(TAG, "%s evaluateJavascriptForTests=%s", this, script);
+        if (isDestroyedOrNoOperation(NO_WARN)) return;
+        JavaScriptCallback jsCallback = null;
+        if (callback != null) {
+            jsCallback = jsonResult -> callback.onResult(jsonResult);
+        }
+
+        mWebContents.evaluateJavaScriptForTests(script, jsCallback);
+    }
+
+    public void postMessageToFrame(
+            String frameName, String message, String targetOrigin, MessagePort[] sentPorts) {
+        if (isDestroyedOrNoOperation(WARN)) return;
+        mWebContents.postMessageToFrame(frameName, message, null, targetOrigin, sentPorts);
     }
 
     /**
-     * @see ContentViewCore.evaluateJavaScriptEvenIfNotYetNavigated(String)
+     * Creates a message channel and returns the ports for each end of the channel.
      */
-    public void evaluateJavaScriptEvenIfNotYetNavigated(String script) {
-        mContentViewCore.evaluateJavaScriptEvenIfNotYetNavigated(script);
+    public AppWebMessagePort[] createMessageChannel() {
+        if (TRACE) Log.i(TAG, "%s createMessageChannel", this);
+        if (isDestroyedOrNoOperation(WARN)) return null;
+        return AppWebMessagePort.createPair();
+    }
+
+    public boolean hasAccessedInitialDocument() {
+        if (isDestroyedOrNoOperation(NO_WARN)) return false;
+        return mWebContents.hasAccessedInitialDocument();
+    }
+
+    private WebContentsAccessibility getWebContentsAccessibility() {
+        return WebContentsAccessibility.fromWebContents(mWebContents);
+    }
+
+    @TargetApi(Build.VERSION_CODES.M)
+    public void onProvideVirtualStructure(ViewStructure structure) {
+        if (isDestroyedOrNoOperation(WARN)) return;
+        if (!mWebContentsObserver.didEverCommitNavigation()) {
+            // TODO(sgurun) write a test case for this condition crbug/605251
+            structure.setChildCount(0);
+            return;
+        }
+        // for webview, the platform already calculates the scroll (as it is a view) in
+        // ViewStructure tree. Do not offset for it in the snapshop x,y position calculations.
+        getWebContentsAccessibility().onProvideVirtualStructure(structure, true);
+    }
+
+    public void onProvideAutoFillVirtualStructure(ViewStructure structure, int flags) {
+        if (mAutofillProvider != null) {
+            mAutofillProvider.onProvideAutoFillVirtualStructure(structure, flags);
+        }
+    }
+
+    public void autofill(final SparseArray<AutofillValue> values) {
+        if (mAutofillProvider != null) {
+            mAutofillProvider.autofill(values);
+        }
+    }
+
+    public boolean isSelectActionModeAllowed(int actionModeItem) {
+        return (mSettings.getDisabledActionModeMenuItems() & actionModeItem) != actionModeItem;
     }
 
     //--------------------------------------------------------------------------------------------
     //  View and ViewGroup method implementations
     //--------------------------------------------------------------------------------------------
+    /**
+     * Calls android.view.View#startActivityForResult.  A RuntimeException will
+     * be thrown by Android framework if startActivityForResult is called with
+     * a non-Activity context.
+     */
+    void startActivityForResult(Intent intent, int requestCode) {
+        // Even in fullscreen mode, startActivityForResult will still use the
+        // initial internal access delegate because it has access to
+        // the hidden API View#startActivityForResult.
+        mFullScreenTransitionsState.getInitialInternalAccessDelegate()
+                .super_startActivityForResult(intent, requestCode);
+    }
+
+    void startProcessTextIntent(Intent intent) {
+        // on Android M, WebView is not able to replace the text with the processed text.
+        // So set the readonly flag for M.
+        if (Build.VERSION.SDK_INT == Build.VERSION_CODES.M) {
+            intent.putExtra(Intent.EXTRA_PROCESS_TEXT_READONLY, true);
+        }
+
+        if (WindowAndroid.activityFromContext(mContext) == null) {
+            mContext.startActivity(intent);
+            return;
+        }
+
+        startActivityForResult(intent, PROCESS_TEXT_REQUEST_CODE);
+    }
+
+    public void onActivityResult(int requestCode, int resultCode, Intent data) {
+        if (isDestroyedOrNoOperation(NO_WARN)) return;
+        if (requestCode == PROCESS_TEXT_REQUEST_CODE) {
+            SelectionPopupController.fromWebContents(mWebContents)
+                    .onReceivedProcessTextResult(resultCode, data);
+        } else {
+            Log.e(TAG, "Received activity result for an unknown request code %d", requestCode);
+        }
+    }
 
     /**
      * @see android.webkit.View#onTouchEvent()
      */
     public boolean onTouchEvent(MotionEvent event) {
-        if (mNativeAwContents == 0) return false;
-
-        if (event.getActionMasked() == MotionEvent.ACTION_DOWN) {
-            mSettings.setSpatialNavigationEnabled(false);
-        }
-
-        mScrollOffsetManager.setProcessingTouchEvent(true);
-        boolean rv = mContentViewCore.onTouchEvent(event);
-        mScrollOffsetManager.setProcessingTouchEvent(false);
-
-        if (event.getActionMasked() == MotionEvent.ACTION_DOWN) {
-            int actionIndex = event.getActionIndex();
-
-            // Note this will trigger IPC back to browser even if nothing is hit.
-            nativeRequestNewHitTestDataAt(mNativeAwContents,
-                                          (int) Math.round(event.getX(actionIndex) / mDIPScale),
-                                          (int) Math.round(event.getY(actionIndex) / mDIPScale));
-        }
-
-        if (mOverScrollGlow != null && event.getActionMasked() == MotionEvent.ACTION_UP) {
-            mOverScrollGlow.releaseAll();
-        }
-
-        return rv;
+        return mAwViewMethods.onTouchEvent(event);
     }
 
     /**
      * @see android.view.View#onHoverEvent()
      */
     public boolean onHoverEvent(MotionEvent event) {
-        return mContentViewCore.onHoverEvent(event);
+        return mAwViewMethods.onHoverEvent(event);
     }
 
     /**
      * @see android.view.View#onGenericMotionEvent()
      */
     public boolean onGenericMotionEvent(MotionEvent event) {
-        return mContentViewCore.onGenericMotionEvent(event);
+        return isDestroyedOrNoOperation(NO_WARN) ? false :
+            mContentViewCore.onGenericMotionEvent(event);
     }
 
     /**
      * @see android.view.View#onConfigurationChanged()
      */
     public void onConfigurationChanged(Configuration newConfig) {
-        mContentViewCore.onConfigurationChanged(newConfig);
+        mAwViewMethods.onConfigurationChanged(newConfig);
     }
 
     /**
      * @see android.view.View#onAttachedToWindow()
-     *
-     * Note that this is also called from receivePopupContents.
      */
     public void onAttachedToWindow() {
-        if (mNativeAwContents == 0) return;
-        mIsAttachedToWindow = true;
-
-        mContentViewCore.onAttachedToWindow();
-        nativeOnAttachedToWindow(mNativeAwContents, mContainerView.getWidth(),
-                mContainerView.getHeight());
-        mSettings.setEnableSupportedHardwareAcceleratedFeatures(
-            mContainerView.isHardwareAccelerated());
-
-        if (mComponentCallbacks != null) return;
-        mComponentCallbacks = new AwComponentCallbacks();
-        mContainerView.getContext().registerComponentCallbacks(mComponentCallbacks);
+        if (TRACE) Log.i(TAG, "%s onAttachedToWindow", this);
+        mTemporarilyDetached = false;
+        mAwViewMethods.onAttachedToWindow();
+        mWindowAndroid.getWindowAndroid().getDisplay().addObserver(mDisplayObserver);
     }
 
     /**
      * @see android.view.View#onDetachedFromWindow()
      */
+    @SuppressLint("MissingSuperCall")
     public void onDetachedFromWindow() {
-        mIsAttachedToWindow = false;
-        hideAutofillPopup();
-        if (mNativeAwContents != 0) {
-            nativeOnDetachedFromWindow(mNativeAwContents);
-        }
-
-        mContentViewCore.onDetachedFromWindow();
-
-        mSettings.setEnableSupportedHardwareAcceleratedFeatures(false);
-
-        if (mComponentCallbacks != null) {
-            mContainerView.getContext().unregisterComponentCallbacks(mComponentCallbacks);
-            mComponentCallbacks = null;
-        }
-
-        mScrollAccessibilityHelper.removePostedCallbacks();
-
-        if (mPendingDetachCleanupReferences != null) {
-            for (int i = 0; i < mPendingDetachCleanupReferences.size(); ++i) {
-                mPendingDetachCleanupReferences.get(i).cleanupNow();
-            }
-            mPendingDetachCleanupReferences = null;
-        }
+        if (TRACE) Log.i(TAG, "%s onDetachedFromWindow", this);
+        mWindowAndroid.getWindowAndroid().getDisplay().removeObserver(mDisplayObserver);
+        mAwViewMethods.onDetachedFromWindow();
     }
 
     /**
      * @see android.view.View#onWindowFocusChanged()
      */
     public void onWindowFocusChanged(boolean hasWindowFocus) {
-        mWindowFocused = hasWindowFocus;
-        mContentViewCore.onWindowFocusChanged(hasWindowFocus);
+        mAwViewMethods.onWindowFocusChanged(hasWindowFocus);
     }
 
     /**
      * @see android.view.View#onFocusChanged()
      */
     public void onFocusChanged(boolean focused, int direction, Rect previouslyFocusedRect) {
-        mContainerViewFocused = focused;
-        mContentViewCore.onFocusChanged(focused);
+        if (!mTemporarilyDetached) {
+            mAwViewMethods.onFocusChanged(focused, direction, previouslyFocusedRect);
+        }
+    }
+
+    /**
+     * @see android.view.View#onStartTemporaryDetach()
+     */
+    public void onStartTemporaryDetach() {
+        mTemporarilyDetached = true;
+    }
+
+    /**
+     * @see android.view.View#onFinishTemporaryDetach()
+     */
+    public void onFinishTemporaryDetach() {
+        mTemporarilyDetached = false;
     }
 
     /**
      * @see android.view.View#onSizeChanged()
      */
     public void onSizeChanged(int w, int h, int ow, int oh) {
-        if (mNativeAwContents == 0) return;
-        mScrollOffsetManager.setContainerViewSize(w, h);
-        // The AwLayoutSizer needs to go first so that if we're in fixedLayoutSize mode the update
-        // to enter fixedLayoutSize mode is sent before the first resize update.
-        mLayoutSizer.onSizeChanged(w, h, ow, oh);
-        mContentViewCore.onPhysicalBackingSizeChanged(w, h);
-        mContentViewCore.onSizeChanged(w, h, ow, oh);
-        nativeOnSizeChanged(mNativeAwContents, w, h, ow, oh);
+        mAwViewMethods.onSizeChanged(w, h, ow, oh);
     }
 
     /**
      * @see android.view.View#onVisibilityChanged()
      */
     public void onVisibilityChanged(View changedView, int visibility) {
-        boolean viewVisible = mContainerView.getVisibility() == View.VISIBLE;
-        if (mIsViewVisible == viewVisible) return;
-        setViewVisibilityInternal(viewVisible);
+        mAwViewMethods.onVisibilityChanged(changedView, visibility);
     }
 
     /**
      * @see android.view.View#onWindowVisibilityChanged()
      */
     public void onWindowVisibilityChanged(int visibility) {
-        boolean windowVisible = visibility == View.VISIBLE;
-        if (mIsWindowVisible == windowVisible) return;
-        setWindowVisibilityInternal(windowVisible);
+        mAwViewMethods.onWindowVisibilityChanged(visibility);
     }
 
     private void setViewVisibilityInternal(boolean visible) {
         mIsViewVisible = visible;
-        if (mNativeAwContents == 0) return;
-        nativeSetViewVisibility(mNativeAwContents, mIsViewVisible);
+        if (!isDestroyedOrNoOperation(NO_WARN)) {
+            nativeSetViewVisibility(mNativeAwContents, mIsViewVisible);
+        }
+        postUpdateContentViewCoreVisibility();
     }
 
     private void setWindowVisibilityInternal(boolean visible) {
+        mInvalidateRootViewOnNextDraw |= Build.VERSION.SDK_INT <= Build.VERSION_CODES.LOLLIPOP
+                && visible && !mIsWindowVisible;
         mIsWindowVisible = visible;
-        if (mNativeAwContents == 0) return;
-        nativeSetWindowVisibility(mNativeAwContents, mIsWindowVisible);
+        if (!isDestroyedOrNoOperation(NO_WARN)) {
+            nativeSetWindowVisibility(mNativeAwContents, mIsWindowVisible);
+        }
+        postUpdateContentViewCoreVisibility();
+    }
+
+    private void postUpdateContentViewCoreVisibility() {
+        if (mIsUpdateVisibilityTaskPending) return;
+        // When WebView is attached to a visible window, WebView will be
+        // attached to a window whose visibility is initially invisible, then
+        // the window visibility will be updated to true. This means CVC
+        // visibility will be set to false then true immediately, in the same
+        // function call of View#dispatchAttachedToWindow.  DetachedFromWindow
+        // is a similar case, where window visibility changes before AwContents
+        // is detached from window.
+        //
+        // To prevent this flip of CVC visibility, post the task to update CVC
+        // visibility during attach, detach and window visibility change.
+        mIsUpdateVisibilityTaskPending = true;
+        mHandler.post(mUpdateVisibilityRunnable);
+    }
+
+    private void updateContentViewCoreVisibility() {
+        mIsUpdateVisibilityTaskPending = false;
+        if (isDestroyedOrNoOperation(NO_WARN)) return;
+        boolean contentViewCoreVisible = nativeIsVisible(mNativeAwContents);
+
+        if (contentViewCoreVisible && !mIsContentViewCoreVisible) {
+            mContentViewCore.onShow();
+        } else if (!contentViewCoreVisible && mIsContentViewCoreVisible) {
+            mContentViewCore.onHide();
+        }
+        mIsContentViewCoreVisible = contentViewCoreVisible;
+        updateChildProcessImportance();
+    }
+
+    /**
+     * Returns true if the page is visible according to DOM page visibility API.
+     * See http://www.w3.org/TR/page-visibility/
+     * This method is only called by tests and will return the supposed CVC
+     * visibility without waiting a pending mUpdateVisibilityRunnable to run.
+     */
+    @VisibleForTesting
+    public boolean isPageVisible() {
+        if (isDestroyedOrNoOperation(NO_WARN)) return mIsContentViewCoreVisible;
+        return nativeIsVisible(mNativeAwContents);
     }
 
     /**
@@ -1643,7 +2674,8 @@ public class AwContents {
      * @return False if saving state failed.
      */
     public boolean saveState(Bundle outState) {
-        if (mNativeAwContents == 0 || outState == null) return false;
+        if (TRACE) Log.i(TAG, "%s saveState", this);
+        if (isDestroyedOrNoOperation(WARN) || outState == null) return false;
 
         byte[] state = nativeGetOpaqueState(mNativeAwContents);
         if (state == null) return false;
@@ -1658,7 +2690,8 @@ public class AwContents {
      * @return False if restoring state failed.
      */
     public boolean restoreState(Bundle inState) {
-        if (mNativeAwContents == 0 || inState == null) return false;
+        if (TRACE) Log.i(TAG, "%s restoreState", this);
+        if (isDestroyedOrNoOperation(WARN) || inState == null) return false;
 
         byte[] state = inState.getByteArray(SAVE_RESTORE_STATE_KEY);
         if (state == null) return false;
@@ -1669,24 +2702,34 @@ public class AwContents {
         // but is optimized out in the restoreState case because the title is
         // already restored. See WebContentsImpl::UpdateTitleForEntry. So we
         // call the callback explicitly here.
-        if (result) mContentsClient.onReceivedTitle(mContentViewCore.getTitle());
+        if (result) mContentsClient.onReceivedTitle(mWebContents.getTitle());
 
         return result;
     }
 
     /**
-     * @see ContentViewCore#addPossiblyUnsafeJavascriptInterface(Object, String, Class)
+     * @see JavascriptInjector#addPossiblyUnsafeInterface(Object, String, Class)
      */
-    public void addPossiblyUnsafeJavascriptInterface(Object object, String name,
-            Class<? extends Annotation> requiredAnnotation) {
-        mContentViewCore.addPossiblyUnsafeJavascriptInterface(object, name, requiredAnnotation);
+    @SuppressLint("NewApi")  // JavascriptInterface requires API level 17.
+    public void addJavascriptInterface(Object object, String name) {
+        if (TRACE) Log.i(TAG, "%s addJavascriptInterface=%s", this, name);
+        if (isDestroyedOrNoOperation(WARN)) return;
+        Class<? extends Annotation> requiredAnnotation = null;
+        if (mAppTargetSdkVersion >= Build.VERSION_CODES.JELLY_BEAN_MR1) {
+            requiredAnnotation = JavascriptInterface.class;
+        }
+
+        getJavascriptInjector().addPossiblyUnsafeInterface(object, name, requiredAnnotation);
     }
 
     /**
      * @see android.webkit.WebView#removeJavascriptInterface(String)
      */
     public void removeJavascriptInterface(String interfaceName) {
-        mContentViewCore.removeJavascriptInterface(interfaceName);
+        if (TRACE) Log.i(TAG, "%s removeInterface=%s", this, interfaceName);
+        if (isDestroyedOrNoOperation(WARN)) return;
+
+        getJavascriptInjector().removeInterface(interfaceName);
     }
 
     /**
@@ -1696,45 +2739,119 @@ public class AwContents {
      * @return The AccessibilityNodeProvider, if available, or null otherwise.
      */
     public AccessibilityNodeProvider getAccessibilityNodeProvider() {
-        return mContentViewCore.getAccessibilityNodeProvider();
-    }
-
-    /**
-     * @see android.webkit.WebView#onInitializeAccessibilityNodeInfo(AccessibilityNodeInfo)
-     */
-    public void onInitializeAccessibilityNodeInfo(AccessibilityNodeInfo info) {
-        mContentViewCore.onInitializeAccessibilityNodeInfo(info);
-    }
-
-    /**
-     * @see android.webkit.WebView#onInitializeAccessibilityEvent(AccessibilityEvent)
-     */
-    public void onInitializeAccessibilityEvent(AccessibilityEvent event) {
-        mContentViewCore.onInitializeAccessibilityEvent(event);
+        return mAwViewMethods.getAccessibilityNodeProvider();
     }
 
     public boolean supportsAccessibilityAction(int action) {
-        return mContentViewCore.supportsAccessibilityAction(action);
+        return isDestroyedOrNoOperation(WARN)
+                ? false
+                : getWebContentsAccessibility().supportsAction(action);
     }
 
     /**
      * @see android.webkit.WebView#performAccessibilityAction(int, Bundle)
      */
     public boolean performAccessibilityAction(int action, Bundle arguments) {
-        return mContentViewCore.performAccessibilityAction(action, arguments);
+        return mAwViewMethods.performAccessibilityAction(action, arguments);
     }
 
     /**
      * @see android.webkit.WebView#clearFormData()
      */
     public void hideAutofillPopup() {
-        if (mAwAutofillManagerDelegate != null)
-            mAwAutofillManagerDelegate.hideAutofillPopup();
+        if (TRACE) Log.i(TAG, "%s hideAutofillPopup", this);
+        if (mAwAutofillClient != null) {
+            mAwAutofillClient.hideAutofillPopup();
+        }
     }
 
     public void setNetworkAvailable(boolean networkUp) {
-        if (mNativeAwContents == 0) return;
-        nativeSetJsOnlineProperty(mNativeAwContents, networkUp);
+        if (TRACE) Log.i(TAG, "%s setNetworkAvailable=%s", this, networkUp);
+        if (!isDestroyedOrNoOperation(WARN)) {
+            // For backward compatibility when an app uses this API disable the
+            // Network Information API to prevent inconsistencies,
+            // see crbug.com/520088.
+            NetworkChangeNotifier.setAutoDetectConnectivityState(false);
+            nativeSetJsOnlineProperty(mNativeAwContents, networkUp);
+        }
+    }
+
+    /**
+     * Inserts a {@link VisualStateCallback}.
+     *
+     * The {@link VisualStateCallback} will be inserted in Blink and will be invoked when the
+     * contents of the DOM tree at the moment that the callback was inserted (or later) are drawn
+     * into the screen. In other words, the following events need to happen before the callback is
+     * invoked:
+     * 1. The DOM tree is committed becoming the pending tree - see ThreadProxy::BeginMainFrame
+     * 2. The pending tree is activated becoming the active tree
+     * 3. A frame swap happens that draws the active tree into the screen
+     *
+     * @param requestId an id that will be returned from the callback invocation to allow
+     * callers to match requests with callbacks.
+     * @param callback the callback to be inserted
+     * @throw IllegalStateException if this method is invoked after {@link #destroy()} has been
+     * called.
+     */
+    public void insertVisualStateCallback(long requestId, VisualStateCallback callback) {
+        if (TRACE) Log.i(TAG, "%s insertVisualStateCallback", this);
+        if (isDestroyed(NO_WARN)) throw new IllegalStateException(
+                "insertVisualStateCallback cannot be called after the WebView has been destroyed");
+        nativeInsertVisualStateCallback(mNativeAwContents, requestId, callback);
+    }
+
+    public boolean isPopupWindow() {
+        return mIsPopupWindow;
+    }
+
+    private void updateChildProcessImportance() {
+        @ChildProcessImportance
+        int effectiveImportance = ChildProcessImportance.IMPORTANT;
+        if (mRendererPriorityWaivedWhenNotVisible && !mIsContentViewCoreVisible) {
+            effectiveImportance = ChildProcessImportance.NORMAL;
+        } else {
+            switch (mRendererPriority) {
+                case RendererPriority.INITIAL:
+                case RendererPriority.HIGH:
+                    effectiveImportance = ChildProcessImportance.IMPORTANT;
+                    break;
+                case RendererPriority.LOW:
+                    effectiveImportance = ChildProcessImportance.MODERATE;
+                    break;
+                case RendererPriority.WAIVED:
+                    effectiveImportance = ChildProcessImportance.NORMAL;
+                    break;
+                default:
+                    assert false;
+            }
+        }
+        mWebContents.setImportance(effectiveImportance);
+    }
+
+    @RendererPriority
+    public int getRendererRequestedPriority() {
+        return mRendererPriority;
+    }
+
+    public boolean getRendererPriorityWaivedWhenNotVisible() {
+        return mRendererPriorityWaivedWhenNotVisible;
+    }
+
+    public void setRendererPriorityPolicy(
+            @RendererPriority int rendererRequestedPriority, boolean waivedWhenNotVisible) {
+        mRendererPriority = rendererRequestedPriority;
+        mRendererPriorityWaivedWhenNotVisible = waivedWhenNotVisible;
+        updateChildProcessImportance();
+    }
+
+    public void setTextClassifier(TextClassifier textClassifier) {
+        assert mWebContents != null;
+        SelectionPopupController.fromWebContents(mWebContents).setTextClassifier(textClassifier);
+    }
+
+    public TextClassifier getTextClassifier() {
+        assert mWebContents != null;
+        return SelectionPopupController.fromWebContents(mWebContents).getTextClassifier();
     }
 
     //--------------------------------------------------------------------------------------------
@@ -1758,12 +2875,18 @@ public class AwContents {
         mFavicon = bitmap;
     }
 
+    @CalledByNative
+    private long onCreateTouchHandle() {
+        PopupTouchHandleDrawable drawable =
+                PopupTouchHandleDrawable.create(mTouchHandleDrawables, mContentViewCore);
+        return drawable.getNativeDrawable();
+    }
+
     /** Callback for generateMHTML. */
     @CalledByNative
-    private static void generateMHTMLCallback(
-            String path, long size, ValueCallback<String> callback) {
+    private static void generateMHTMLCallback(String path, long size, Callback<String> callback) {
         if (callback == null) return;
-        callback.onReceiveValue(size < 0 ? null : path);
+        callback.onResult(size < 0 ? null : path);
     }
 
     @CalledByNative
@@ -1771,30 +2894,18 @@ public class AwContents {
         mContentsClient.onReceivedHttpAuthRequest(handler, host, realm);
     }
 
-    private class AwGeolocationCallback implements GeolocationPermissions.Callback {
+    public AwGeolocationPermissions getGeolocationPermissions() {
+        return mBrowserContext.getGeolocationPermissions();
+    }
 
-        @Override
-        public void invoke(final String origin, final boolean allow, final boolean retain) {
-            ThreadUtils.runOnUiThread(new Runnable() {
-                @Override
-                public void run() {
-                    if (retain) {
-                        if (allow) {
-                            mBrowserContext.getGeolocationPermissions().allow(origin);
-                        } else {
-                            mBrowserContext.getGeolocationPermissions().deny(origin);
-                        }
-                    }
-                    if (mNativeAwContents == 0) return;
-                    nativeInvokeGeolocationCallback(mNativeAwContents, allow, origin);
-                }
-            });
-        }
+    public void invokeGeolocationCallback(boolean value, String requestingFrame) {
+        if (isDestroyedOrNoOperation(NO_WARN)) return;
+        nativeInvokeGeolocationCallback(mNativeAwContents, value, requestingFrame);
     }
 
     @CalledByNative
     private void onGeolocationPermissionsShowPrompt(String origin) {
-        if (mNativeAwContents == 0) return;
+        if (isDestroyedOrNoOperation(NO_WARN)) return;
         AwGeolocationPermissions permissions = mBrowserContext.getGeolocationPermissions();
         // Reject if geoloaction is disabled, or the origin has a retained deny
         if (!mSettings.getGeolocationEnabled()) {
@@ -1808,12 +2919,22 @@ public class AwContents {
             return;
         }
         mContentsClient.onGeolocationPermissionsShowPrompt(
-                origin, new AwGeolocationCallback());
+                origin, new AwGeolocationCallback(origin, this));
     }
 
     @CalledByNative
     private void onGeolocationPermissionsHidePrompt() {
         mContentsClient.onGeolocationPermissionsHidePrompt();
+    }
+
+    @CalledByNative
+    private void onPermissionRequest(AwPermissionRequest awPermissionRequest) {
+        mContentsClient.onPermissionRequest(awPermissionRequest);
+    }
+
+    @CalledByNative
+    private void onPermissionRequestCanceled(AwPermissionRequest awPermissionRequest) {
+        mContentsClient.onPermissionRequestCanceled(awPermissionRequest);
     }
 
     @CalledByNative
@@ -1830,6 +2951,22 @@ public class AwContents {
         mContentsClient.getCallbackHelper().postOnNewPicture(mPictureListenerContentProvider);
     }
 
+    /**
+     * Invokes the given {@link VisualStateCallback}.
+     *
+     * @param callback the callback to be invoked
+     * @param requestId the id passed to {@link AwContents#insertVisualStateCallback}
+     * @param result true if the callback should succeed and false otherwise
+     */
+    @CalledByNative
+    public void invokeVisualStateCallback(
+            final VisualStateCallback callback, final long requestId) {
+        if (isDestroyedOrNoOperation(NO_WARN)) return;
+        // Posting avoids invoking the callback inside invoking_composite_
+        // (see synchronous_compositor_impl.cc and crbug/452530).
+        mHandler.post(() -> callback.onComplete(requestId));
+    }
+
     // Called as a result of nativeUpdateLastHitTestData.
     @CalledByNative
     private void updateHitTestData(
@@ -1842,19 +2979,11 @@ public class AwContents {
     }
 
     @CalledByNative
-    private boolean requestDrawGL(Canvas canvas) {
-        return mInternalAccessAdapter.requestDrawGL(canvas);
-    }
-
-    private static final boolean SUPPORTS_ON_ANIMATION =
-            Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN;
-
-    @CalledByNative
     private void postInvalidateOnAnimation() {
-        if (SUPPORTS_ON_ANIMATION) {
+        if (!mWindowAndroid.getWindowAndroid().isInsideVSync()) {
             mContainerView.postInvalidateOnAnimation();
         } else {
-            mContainerView.postInvalidate();
+            mContainerView.invalidate();
         }
     }
 
@@ -1878,75 +3007,160 @@ public class AwContents {
     }
 
     @CalledByNative
-    private void setMaxContainerViewScrollOffset(int maxX, int maxY) {
-        mScrollOffsetManager.setMaxScrollOffset(maxX, maxY);
+    private void scrollContainerViewTo(int xPx, int yPx) {
+        // Both xPx and yPx are in physical pixel scale.
+        mScrollOffsetManager.scrollContainerViewTo(xPx, yPx);
     }
 
     @CalledByNative
-    private void scrollContainerViewTo(int x, int y) {
-        mScrollOffsetManager.scrollContainerViewTo(x, y);
-    }
-
-    @CalledByNative
-    private boolean isFlingActive() {
-        return mScrollOffsetManager.isFlingActive();
-    }
-
-    @CalledByNative
-    private void setContentsSize(int widthDip, int heightDip) {
-        mContentWidthDip = widthDip;
-        mContentHeightDip = heightDip;
-    }
-
-    @CalledByNative
-    private void setPageScaleFactorAndLimits(
+    private void updateScrollState(int maxContainerViewScrollOffsetX,
+            int maxContainerViewScrollOffsetY, int contentWidthDip, int contentHeightDip,
             float pageScaleFactor, float minPageScaleFactor, float maxPageScaleFactor) {
-        if (mPageScaleFactor == pageScaleFactor &&
-            mMinPageScaleFactor == minPageScaleFactor &&
-            mMaxPageScaleFactor == maxPageScaleFactor)
-            return;
-        mMinPageScaleFactor = minPageScaleFactor;
-        mMaxPageScaleFactor = maxPageScaleFactor;
-        if (mPageScaleFactor != pageScaleFactor) {
-          float oldPageScaleFactor = mPageScaleFactor;
-          mPageScaleFactor = pageScaleFactor;
-          mContentsClient.getCallbackHelper().postOnScaleChangedScaled(
-              (float)(oldPageScaleFactor * mDIPScale),
-              (float)(mPageScaleFactor * mDIPScale));
-        }
+        mContentWidthDip = contentWidthDip;
+        mContentHeightDip = contentHeightDip;
+        mScrollOffsetManager.setMaxScrollOffset(maxContainerViewScrollOffsetX,
+                maxContainerViewScrollOffsetY);
+        setPageScaleFactorAndLimits(pageScaleFactor, minPageScaleFactor, maxPageScaleFactor);
     }
 
     @CalledByNative
-    private void setAwAutofillManagerDelegate(AwAutofillManagerDelegate delegate) {
-        mAwAutofillManagerDelegate = delegate;
-        delegate.init(mContentViewCore);
+    private void setAwAutofillClient(AwAutofillClient client) {
+        mAwAutofillClient = client;
+        client.init(mContentViewCore);
     }
 
     @CalledByNative
-    private void didOverscroll(int deltaX, int deltaY) {
-        if (mOverScrollGlow != null) {
-            mOverScrollGlow.setOverScrollDeltas(deltaX, deltaY);
-        }
-
+    private void didOverscroll(int deltaX, int deltaY, float velocityX, float velocityY) {
         mScrollOffsetManager.overScrollBy(deltaX, deltaY);
 
-        if (mOverScrollGlow != null && mOverScrollGlow.isAnimating()) {
-            mContainerView.invalidate();
+        if (mOverScrollGlow == null) return;
+
+        mOverScrollGlow.setOverScrollDeltas(deltaX, deltaY);
+        final int oldX = mContainerView.getScrollX();
+        final int oldY = mContainerView.getScrollY();
+        final int x = oldX + deltaX;
+        final int y = oldY + deltaY;
+        final int scrollRangeX = mScrollOffsetManager.computeMaximumHorizontalScrollOffset();
+        final int scrollRangeY = mScrollOffsetManager.computeMaximumVerticalScrollOffset();
+        // absorbGlow() will release the glow if it is not finished.
+        mOverScrollGlow.absorbGlow(x, y, oldX, oldY, scrollRangeX, scrollRangeY,
+                (float) Math.hypot(velocityX, velocityY));
+
+        if (mOverScrollGlow.isAnimating()) {
+            postInvalidateOnAnimation();
         }
+    }
+
+    /**
+     * Determine if at least one edge of the WebView extends over the edge of the window.
+     */
+    private boolean extendsOutOfWindow() {
+        int loc[] = new int[2];
+        mContainerView.getLocationOnScreen(loc);
+        int x = loc[0];
+        int y = loc[1];
+        mContainerView.getRootView().getLocationOnScreen(loc);
+        int rootX = loc[0];
+        int rootY = loc[1];
+
+        // Get the position of the current view, relative to its root view
+        int relativeX = x - rootX;
+        int relativeY = y - rootY;
+
+        if (relativeX < 0 || relativeY < 0
+                || relativeX + mContainerView.getWidth() > mContainerView.getRootView().getWidth()
+                || relativeY + mContainerView.getHeight()
+                        > mContainerView.getRootView().getHeight()) {
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * Determine if it's reasonable to show any sort of interstitial. If the WebView is not visible,
+     * the user may not be able to interact with the UI.
+     * @return true if the WebView is visible
+     */
+    @VisibleForTesting
+    @CalledByNative
+    protected boolean canShowInterstitial() {
+        return mIsAttachedToWindow && mIsViewVisible;
+    }
+
+    @CalledByNative
+    private int getErrorUiType() {
+        if (extendsOutOfWindow()) {
+            return ErrorUiType.QUIET_GIANT;
+        } else if (canShowBigInterstitial()) {
+            return ErrorUiType.LOUD;
+        } else {
+            return ErrorUiType.QUIET_SMALL;
+        }
+    }
+
+    /**
+     * Determine if it's suitable to show the interstitial for browsers and main UIs. If the WebView
+     * is close to full-screen, we assume the app is using it as the main UI, so we show the same
+     * interstitial Chrome uses. Otherwise, we assume the WebView is part of a larger composed page,
+     * and will show a different interstitial.
+     * @return true if the WebView should display the large interstitial
+     */
+    @VisibleForTesting
+    protected boolean canShowBigInterstitial() {
+        double percentOfScreenHeight =
+                (double) mContainerView.getHeight() / mContainerView.getRootView().getHeight();
+
+        // Make a guess as to whether the WebView is the predominant part of the UI
+        return mContainerView.getWidth() == mContainerView.getRootView().getWidth()
+                && percentOfScreenHeight >= MIN_SCREEN_HEIGHT_PERCENTAGE_FOR_INTERSTITIAL;
+    }
+
+    @VisibleForTesting
+    public void evaluateJavaScriptOnInterstitialForTesting(
+            String script, final Callback<String> callback) {
+        if (TRACE) Log.i(TAG, "%s evaluateJavaScriptOnInterstitialForTesting=%s", this, script);
+        if (isDestroyedOrNoOperation(WARN)) return;
+        JavaScriptCallback jsCallback = null;
+        if (callback != null) {
+            jsCallback = jsonResult -> callback.onResult(jsonResult);
+        }
+
+        nativeEvaluateJavaScriptOnInterstitialForTesting(mNativeAwContents, script, jsCallback);
+    }
+
+    @CalledByNative
+    private static void onEvaluateJavaScriptResultForTesting(
+            String jsonResult, JavaScriptCallback callback) {
+        callback.handleJavaScriptResult(jsonResult);
     }
 
     // -------------------------------------------------------------------------------------------
     // Helper methods
     // -------------------------------------------------------------------------------------------
 
-    private void saveWebArchiveInternal(String path, final ValueCallback<String> callback) {
-        if (path == null || mNativeAwContents == 0) {
-            ThreadUtils.runOnUiThread(new Runnable() {
-                @Override
-                public void run() {
-                    callback.onReceiveValue(null);
-                }
-            });
+    private void setPageScaleFactorAndLimits(
+            float pageScaleFactor, float minPageScaleFactor, float maxPageScaleFactor) {
+        if (mPageScaleFactor == pageScaleFactor
+                && mMinPageScaleFactor == minPageScaleFactor
+                && mMaxPageScaleFactor == maxPageScaleFactor) {
+            return;
+        }
+        mMinPageScaleFactor = minPageScaleFactor;
+        mMaxPageScaleFactor = maxPageScaleFactor;
+        if (mPageScaleFactor != pageScaleFactor) {
+            float oldPageScaleFactor = mPageScaleFactor;
+            mPageScaleFactor = pageScaleFactor;
+            float dipScale = getDeviceScaleFactor();
+            mContentsClient.getCallbackHelper().postOnScaleChangedScaled(
+                    oldPageScaleFactor * dipScale, mPageScaleFactor * dipScale);
+        }
+    }
+
+    private void saveWebArchiveInternal(String path, final Callback<String> callback) {
+        if (path == null || isDestroyedOrNoOperation(WARN)) {
+            if (callback == null) return;
+
+            ThreadUtils.runOnUiThread(() -> callback.onResult(null));
         } else {
             nativeGenerateMHTML(mNativeAwContents, path, callback);
         }
@@ -1982,16 +3196,417 @@ public class AwContents {
             if (!new File(testName).exists()) return testName;
         }
 
-        Log.e(TAG, "Unable to auto generate archive name for path: " + baseName);
+        Log.e(TAG, "Unable to auto generate archive name for path: %s", baseName);
         return null;
     }
 
+    @Override
     public void extractSmartClipData(int x, int y, int width, int height) {
-        mContentViewCore.extractSmartClipData(x, y, width, height);
+        if (!isDestroyedOrNoOperation(WARN)) {
+            mWebContents.requestSmartClipExtract(x, y, width, height);
+        }
     }
 
-    public void setSmartClipDataListener(ContentViewCore.SmartClipDataListener listener) {
-        mContentViewCore.setSmartClipDataListener(listener);
+    @Override
+    public void setSmartClipResultHandler(final Handler resultHandler) {
+        if (isDestroyedOrNoOperation(WARN)) return;
+
+        mWebContents.setSmartClipResultHandler(resultHandler);
+    }
+
+    protected void insertVisualStateCallbackIfNotDestroyed(
+            long requestId, VisualStateCallback callback) {
+        if (TRACE) Log.i(TAG, "%s insertVisualStateCallbackIfNotDestroyed", this);
+        if (isDestroyedOrNoOperation(NO_WARN)) return;
+        nativeInsertVisualStateCallback(mNativeAwContents, requestId, callback);
+    }
+
+    public static boolean isDpadEvent(KeyEvent event) {
+        if (event.getAction() == KeyEvent.ACTION_DOWN) {
+            switch (event.getKeyCode()) {
+                case KeyEvent.KEYCODE_DPAD_CENTER:
+                case KeyEvent.KEYCODE_DPAD_DOWN:
+                case KeyEvent.KEYCODE_DPAD_UP:
+                case KeyEvent.KEYCODE_DPAD_LEFT:
+                case KeyEvent.KEYCODE_DPAD_RIGHT:
+                    return true;
+            }
+        }
+        return false;
+    }
+
+    // --------------------------------------------------------------------------------------------
+    // This is the AwViewMethods implementation that does real work. The AwViewMethodsImpl is
+    // hooked up to the WebView in embedded mode and to the FullScreenView in fullscreen mode,
+    // but not to both at the same time.
+    private class AwViewMethodsImpl implements AwViewMethods {
+        private int mLayerType = View.LAYER_TYPE_NONE;
+        private ComponentCallbacks2 mComponentCallbacks;
+
+        // Only valid within software onDraw().
+        private final Rect mClipBoundsTemporary = new Rect();
+
+        @Override
+        public void onDraw(Canvas canvas) {
+            if (isDestroyedOrNoOperation(NO_WARN)) {
+                TraceEvent.instant("EarlyOut_destroyed");
+                canvas.drawColor(getEffectiveBackgroundColor());
+                return;
+            }
+
+            // For hardware draws, the clip at onDraw time could be different
+            // from the clip during DrawGL.
+            if (!canvas.isHardwareAccelerated() && !canvas.getClipBounds(mClipBoundsTemporary)) {
+                TraceEvent.instant("EarlyOut_software_empty_clip");
+                return;
+            }
+
+            mScrollOffsetManager.syncScrollOffsetFromOnDraw();
+            int scrollX = mContainerView.getScrollX();
+            int scrollY = mContainerView.getScrollY();
+            Rect globalVisibleRect = getGlobalVisibleRect();
+            // Workaround for bug in libhwui on N that does not swap if inserting functor is the
+            // only operation in a canvas. See crbug.com/704212.
+            if (Build.VERSION.SDK_INT == Build.VERSION_CODES.N
+                    || Build.VERSION.SDK_INT == Build.VERSION_CODES.N_MR1) {
+                if (mPaintForNWorkaround == null) {
+                    mPaintForNWorkaround = new Paint();
+                    // Note a completely transparent color will get optimized out. So draw almost
+                    // transparent black, but then scale alpha down to effectively 0.
+                    mPaintForNWorkaround.setColor(Color.argb(1, 0, 0, 0));
+                    ColorMatrix colorMatrix = new ColorMatrix();
+                    colorMatrix.setScale(0.f, 0.f, 0.f, 0.1f);
+                    mPaintForNWorkaround.setColorFilter(new ColorMatrixColorFilter(colorMatrix));
+                }
+                canvas.drawRect(0, 0, 1, 1, mPaintForNWorkaround);
+            }
+            boolean did_draw = nativeOnDraw(mNativeAwContents, canvas,
+                    canvas.isHardwareAccelerated(), scrollX, scrollY, globalVisibleRect.left,
+                    globalVisibleRect.top, globalVisibleRect.right, globalVisibleRect.bottom,
+                    ForceAuxiliaryBitmapRendering.sResult);
+            if (did_draw && canvas.isHardwareAccelerated()
+                    && !ForceAuxiliaryBitmapRendering.sResult) {
+                did_draw = mCurrentFunctor.requestDrawGL(canvas);
+            }
+            if (did_draw) {
+                int scrollXDiff = mContainerView.getScrollX() - scrollX;
+                int scrollYDiff = mContainerView.getScrollY() - scrollY;
+                canvas.translate(-scrollXDiff, -scrollYDiff);
+            } else {
+                TraceEvent.instant("NativeDrawFailed");
+                canvas.drawColor(getEffectiveBackgroundColor());
+            }
+
+            if (mOverScrollGlow != null && mOverScrollGlow.drawEdgeGlows(canvas,
+                    mScrollOffsetManager.computeMaximumHorizontalScrollOffset(),
+                    mScrollOffsetManager.computeMaximumVerticalScrollOffset())) {
+                postInvalidateOnAnimation();
+            }
+
+            if (mInvalidateRootViewOnNextDraw) {
+                mContainerView.getRootView().invalidate();
+                mInvalidateRootViewOnNextDraw = false;
+            }
+        }
+
+        @Override
+        public void onMeasure(int widthMeasureSpec, int heightMeasureSpec) {
+            mLayoutSizer.onMeasure(widthMeasureSpec, heightMeasureSpec);
+        }
+
+        @Override
+        public void requestFocus() {
+            if (isDestroyedOrNoOperation(NO_WARN)) return;
+            if (!mContainerView.isInTouchMode() && mSettings.shouldFocusFirstNode()) {
+                nativeFocusFirstNode(mNativeAwContents);
+            }
+        }
+
+        @Override
+        public void setLayerType(int layerType, Paint paint) {
+            mLayerType = layerType;
+            updateHardwareAcceleratedFeaturesToggle();
+        }
+
+        private void updateHardwareAcceleratedFeaturesToggle() {
+            mSettings.setEnableSupportedHardwareAcceleratedFeatures(
+                    mIsAttachedToWindow && mContainerView.isHardwareAccelerated()
+                            && (mLayerType == View.LAYER_TYPE_NONE
+                                    || mLayerType == View.LAYER_TYPE_HARDWARE));
+        }
+
+        @Override
+        public InputConnection onCreateInputConnection(EditorInfo outAttrs) {
+            return isDestroyedOrNoOperation(NO_WARN)
+                    ? null
+                    : ImeAdapter.fromWebContents(mWebContents).onCreateInputConnection(outAttrs);
+        }
+
+        @Override
+        public boolean onDragEvent(DragEvent event) {
+            return isDestroyedOrNoOperation(NO_WARN)
+                    ? false
+                    : mWebContents.getEventForwarder().onDragEvent(event, mContainerView);
+        }
+
+        @Override
+        public boolean onKeyUp(int keyCode, KeyEvent event) {
+            return isDestroyedOrNoOperation(NO_WARN) ? false
+                    : mContentViewCore.onKeyUp(keyCode, event);
+        }
+
+        @Override
+        public boolean dispatchKeyEvent(KeyEvent event) {
+            if (isDestroyedOrNoOperation(NO_WARN)) return false;
+            if (isDpadEvent(event)) {
+                mSettings.setSpatialNavigationEnabled(true);
+            }
+
+            // Following check is dup'ed from |ContentViewCore.dispatchKeyEvent| to avoid
+            // embedder-specific customization, which is necessary only for WebView.
+            if (GamepadList.dispatchKeyEvent(event)) return true;
+
+            // This check reflects Chrome's behavior and is a workaround for http://b/7697782.
+            if (mContentsClient.hasWebViewClient()
+                    && mContentsClient.shouldOverrideKeyEvent(event)) {
+                return mInternalAccessAdapter.super_dispatchKeyEvent(event);
+            }
+            return mContentViewCore.dispatchKeyEvent(event);
+        }
+
+        @Override
+        public boolean onTouchEvent(MotionEvent event) {
+            if (isDestroyedOrNoOperation(NO_WARN)) return false;
+            if (event.getActionMasked() == MotionEvent.ACTION_DOWN) {
+                mSettings.setSpatialNavigationEnabled(false);
+            }
+
+            mScrollOffsetManager.setProcessingTouchEvent(true);
+            boolean rv = mWebContents.getEventForwarder().onTouchEvent(event);
+            mScrollOffsetManager.setProcessingTouchEvent(false);
+
+            if (event.getActionMasked() == MotionEvent.ACTION_DOWN) {
+                // Note this will trigger IPC back to browser even if nothing is
+                // hit.
+                float eventX = event.getX();
+                float eventY = event.getY();
+                float touchMajor = Math.max(event.getTouchMajor(), event.getTouchMinor());
+                if (!UseZoomForDSFPolicy.isUseZoomForDSFEnabled()) {
+                    float dipScale = getDeviceScaleFactor();
+                    eventX /= dipScale;
+                    eventY /= dipScale;
+                    touchMajor /= dipScale;
+                }
+                nativeRequestNewHitTestDataAt(mNativeAwContents, eventX, eventY, touchMajor);
+            }
+
+            if (mOverScrollGlow != null) {
+                if (event.getActionMasked() == MotionEvent.ACTION_DOWN) {
+                    mOverScrollGlow.setShouldPull(true);
+                } else if (event.getActionMasked() == MotionEvent.ACTION_UP
+                        || event.getActionMasked() == MotionEvent.ACTION_CANCEL) {
+                    mOverScrollGlow.setShouldPull(false);
+                    mOverScrollGlow.releaseAll();
+                }
+            }
+
+            return rv;
+        }
+
+        @Override
+        public boolean onHoverEvent(MotionEvent event) {
+            return isDestroyedOrNoOperation(NO_WARN)
+                    ? false
+                    : mWebContents.getEventForwarder().onHoverEvent(event);
+        }
+
+        @Override
+        public boolean onGenericMotionEvent(MotionEvent event) {
+            return isDestroyedOrNoOperation(NO_WARN) ? false
+                    : mContentViewCore.onGenericMotionEvent(event);
+        }
+
+        @Override
+        public void onConfigurationChanged(Configuration newConfig) {
+            if (!isDestroyedOrNoOperation(NO_WARN)) {
+                mContentViewCore.onConfigurationChanged(newConfig);
+            }
+        }
+
+        @Override
+        public void onAttachedToWindow() {
+            if (isDestroyedOrNoOperation(NO_WARN)) return;
+            if (mIsAttachedToWindow) {
+                Log.w(TAG, "onAttachedToWindow called when already attached. Ignoring");
+                return;
+            }
+            mIsAttachedToWindow = true;
+
+            mContentViewCore.onAttachedToWindow();
+            nativeOnAttachedToWindow(mNativeAwContents, mContainerView.getWidth(),
+                    mContainerView.getHeight());
+            updateHardwareAcceleratedFeaturesToggle();
+            postUpdateContentViewCoreVisibility();
+            mCurrentFunctor.onAttachedToWindow();
+
+            updateDefaultLocale();
+            mSettings.updateAcceptLanguages();
+
+            if (mComponentCallbacks != null) return;
+            mComponentCallbacks = new AwComponentCallbacks();
+            mContext.registerComponentCallbacks(mComponentCallbacks);
+        }
+
+        @Override
+        public void onDetachedFromWindow() {
+            if (isDestroyedOrNoOperation(NO_WARN)) return;
+            if (!mIsAttachedToWindow) {
+                Log.w(TAG, "onDetachedFromWindow called when already detached. Ignoring");
+                return;
+            }
+            mIsAttachedToWindow = false;
+            hideAutofillPopup();
+            nativeOnDetachedFromWindow(mNativeAwContents);
+
+            mContentViewCore.onDetachedFromWindow();
+            updateHardwareAcceleratedFeaturesToggle();
+            postUpdateContentViewCoreVisibility();
+            mCurrentFunctor.onDetachedFromWindow();
+
+            if (mComponentCallbacks != null) {
+                mContext.unregisterComponentCallbacks(mComponentCallbacks);
+                mComponentCallbacks = null;
+            }
+
+            mScrollAccessibilityHelper.removePostedCallbacks();
+            mZoomControls.dismissZoomPicker();
+        }
+
+        @Override
+        public void onWindowFocusChanged(boolean hasWindowFocus) {
+            if (isDestroyedOrNoOperation(NO_WARN)) return;
+            mWindowFocused = hasWindowFocus;
+            mContentViewCore.onWindowFocusChanged(hasWindowFocus);
+        }
+
+        @Override
+        public void onFocusChanged(boolean focused, int direction, Rect previouslyFocusedRect) {
+            if (isDestroyedOrNoOperation(NO_WARN)) return;
+            mContainerViewFocused = focused;
+            mContentViewCore.onFocusChanged(focused, false /* hideKeyboardOnBlur */);
+        }
+
+        @Override
+        public void onSizeChanged(int w, int h, int ow, int oh) {
+            if (isDestroyedOrNoOperation(NO_WARN)) return;
+            mScrollOffsetManager.setContainerViewSize(w, h);
+            // The AwLayoutSizer needs to go first so that if we're in
+            // fixedLayoutSize mode the update
+            // to enter fixedLayoutSize mode is sent before the first resize
+            // update.
+            mLayoutSizer.onSizeChanged(w, h, ow, oh);
+            nativeOnSizeChanged(mNativeAwContents, w, h, ow, oh);
+        }
+
+        @Override
+        public void onVisibilityChanged(View changedView, int visibility) {
+            boolean viewVisible = mContainerView.getVisibility() == View.VISIBLE;
+            if (mIsViewVisible == viewVisible) return;
+            setViewVisibilityInternal(viewVisible);
+        }
+
+        @Override
+        public void onWindowVisibilityChanged(int visibility) {
+            boolean windowVisible = visibility == View.VISIBLE;
+            if (mIsWindowVisible == windowVisible) return;
+            setWindowVisibilityInternal(windowVisible);
+        }
+
+        @Override
+        public void onContainerViewScrollChanged(int l, int t, int oldl, int oldt) {
+            // A side-effect of View.onScrollChanged is that the scroll accessibility event being
+            // sent by the base class implementation. This is completely hidden from the base
+            // classes and cannot be prevented, which is why we need the code below.
+            mScrollAccessibilityHelper.removePostedViewScrolledAccessibilityEventCallback();
+            mScrollOffsetManager.onContainerViewScrollChanged(l, t);
+        }
+
+        @Override
+        public void onContainerViewOverScrolled(int scrollX, int scrollY, boolean clampedX,
+                boolean clampedY) {
+            int oldX = mContainerView.getScrollX();
+            int oldY = mContainerView.getScrollY();
+
+            mScrollOffsetManager.onContainerViewOverScrolled(scrollX, scrollY, clampedX, clampedY);
+
+            if (mOverScrollGlow != null) {
+                mOverScrollGlow.pullGlow(mContainerView.getScrollX(), mContainerView.getScrollY(),
+                        oldX, oldY,
+                        mScrollOffsetManager.computeMaximumHorizontalScrollOffset(),
+                        mScrollOffsetManager.computeMaximumVerticalScrollOffset());
+            }
+        }
+
+        @Override
+        public int computeHorizontalScrollRange() {
+            return mScrollOffsetManager.computeHorizontalScrollRange();
+        }
+
+        @Override
+        public int computeHorizontalScrollOffset() {
+            return mScrollOffsetManager.computeHorizontalScrollOffset();
+        }
+
+        @Override
+        public int computeVerticalScrollRange() {
+            return mScrollOffsetManager.computeVerticalScrollRange();
+        }
+
+        @Override
+        public int computeVerticalScrollOffset() {
+            return mScrollOffsetManager.computeVerticalScrollOffset();
+        }
+
+        @Override
+        public int computeVerticalScrollExtent() {
+            return mScrollOffsetManager.computeVerticalScrollExtent();
+        }
+
+        @Override
+        public void computeScroll() {
+            if (isDestroyedOrNoOperation(NO_WARN)) return;
+            nativeOnComputeScroll(mNativeAwContents, AnimationUtils.currentAnimationTimeMillis());
+        }
+
+        @Override
+        public boolean onCheckIsTextEditor() {
+            return isDestroyedOrNoOperation(NO_WARN)
+                    ? false
+                    : ImeAdapter.fromWebContents(mWebContents).onCheckIsTextEditor();
+        }
+
+        @Override
+        public AccessibilityNodeProvider getAccessibilityNodeProvider() {
+            return isDestroyedOrNoOperation(WARN)
+                    ? null
+                    : getWebContentsAccessibility().getAccessibilityNodeProvider();
+        }
+
+        @Override
+        public boolean performAccessibilityAction(final int action, final Bundle arguments) {
+            return isDestroyedOrNoOperation(WARN)
+                    ? false
+                    : getWebContentsAccessibility().performAction(action, arguments);
+        }
+    }
+
+    // Return true if the GeolocationPermissionAPI should be used.
+    @CalledByNative
+    private boolean useLegacyGeolocationPermissionAPI() {
+        // Always return true since we are not ready to swap the geolocation yet.
+        // TODO: If we decide not to migrate the geolocation, there are some unreachable
+        // code need to remove. http://crbug.com/396184.
+        return true;
     }
 
     //--------------------------------------------------------------------------------------------
@@ -2000,48 +3615,59 @@ public class AwContents {
 
     private static native long nativeInit(AwBrowserContext browserContext);
     private static native void nativeDestroy(long nativeAwContents);
-    private static native void nativeSetAwDrawSWFunctionTable(int functionTablePointer);
-    private static native void nativeSetAwDrawGLFunctionTable(int functionTablePointer);
-    private static native int nativeGetAwDrawGLFunction();
+    private static native boolean nativeHasRequiredHardwareExtensions();
+    private static native void nativeSetAwDrawSWFunctionTable(long functionTablePointer);
+    private static native void nativeSetAwDrawGLFunctionTable(long functionTablePointer);
     private static native int nativeGetNativeInstanceCount();
     private static native void nativeSetShouldDownloadFavicons();
+    private static native void nativeUpdateDefaultLocale(String locale, String localeList);
+
+    private native void nativeEvaluateJavaScriptOnInterstitialForTesting(
+            long nativeAwContents, String script, JavaScriptCallback jsCallback);
     private native void nativeSetJavaPeers(long nativeAwContents, AwContents awContents,
             AwWebContentsDelegate webViewWebContentsDelegate,
-            AwContentsClientBridge contentsClientBridge,
-            AwContentsIoThreadClient ioThreadClient,
-            InterceptNavigationDelegate navigationInterceptionDelegate);
-    private native int nativeGetWebContents(long nativeAwContents);
+            AwContentsClientBridge contentsClientBridge, AwContentsIoThreadClient ioThreadClient,
+            InterceptNavigationDelegate navigationInterceptionDelegate,
+            AutofillProvider autofillProvider);
+    private native WebContents nativeGetWebContents(long nativeAwContents);
+    private native void nativeSetAwGLFunctor(long nativeAwContents, long nativeAwGLFunctor);
 
     private native void nativeDocumentHasImages(long nativeAwContents, Message message);
     private native void nativeGenerateMHTML(
-            long nativeAwContents, String path, ValueCallback<String> callback);
+            long nativeAwContents, String path, Callback<String> callback);
 
     private native void nativeAddVisitedLinks(long nativeAwContents, String[] visitedLinks);
+    private native void nativeZoomBy(long nativeAwContents, float delta);
+    private native void nativeOnComputeScroll(
+            long nativeAwContents, long currentAnimationTimeMillis);
     private native boolean nativeOnDraw(long nativeAwContents, Canvas canvas,
-            boolean isHardwareAccelerated, int scrollX, int scrollY,
-            int clipLeft, int clipTop, int clipRight, int clipBottom);
-    private native void nativeSetGlobalVisibleRect(long nativeAwContents, int visibleLeft,
-            int visibleTop, int visibleRight, int visibleBottom);
+            boolean isHardwareAccelerated, int scrollX, int scrollY, int visibleLeft,
+            int visibleTop, int visibleRight, int visibleBottom,
+            boolean forceAuxiliaryBitmapRendering);
     private native void nativeFindAllAsync(long nativeAwContents, String searchString);
     private native void nativeFindNext(long nativeAwContents, boolean forward);
     private native void nativeClearMatches(long nativeAwContents);
     private native void nativeClearCache(long nativeAwContents, boolean includeDiskFiles);
+    private native void nativeKillRenderProcess(long nativeAwContents);
     private native byte[] nativeGetCertificate(long nativeAwContents);
 
-    // Coordinates in desity independent pixels.
-    private native void nativeRequestNewHitTestDataAt(long nativeAwContents, int x, int y);
+    // Coordinates are in physical pixels when --use-zoom-for-dsf is enabled.
+    // Otherwise, coordinates are in desity independent pixels.
+    private native void nativeRequestNewHitTestDataAt(long nativeAwContents, float x, float y,
+            float touchMajor);
     private native void nativeUpdateLastHitTestData(long nativeAwContents);
 
     private native void nativeOnSizeChanged(long nativeAwContents, int w, int h, int ow, int oh);
     private native void nativeScrollTo(long nativeAwContents, int x, int y);
+    private native void nativeSmoothScroll(
+            long nativeAwContents, int targetX, int targetY, long durationMs);
     private native void nativeSetViewVisibility(long nativeAwContents, boolean visible);
     private native void nativeSetWindowVisibility(long nativeAwContents, boolean visible);
     private native void nativeSetIsPaused(long nativeAwContents, boolean paused);
     private native void nativeOnAttachedToWindow(long nativeAwContents, int w, int h);
-    private static native void nativeOnDetachedFromWindow(long nativeAwContents);
+    private native void nativeOnDetachedFromWindow(long nativeAwContents);
+    private native boolean nativeIsVisible(long nativeAwContents);
     private native void nativeSetDipScale(long nativeAwContents, float dipScale);
-    private native void nativeSetFixedLayoutSize(long nativeAwContents,
-            int widthDip, int heightDip);
 
     // Returns null if save state fails.
     private native byte[] nativeGetOpaqueState(long nativeAwContents);
@@ -2049,23 +3675,31 @@ public class AwContents {
     // Returns false if restore state fails.
     private native boolean nativeRestoreFromOpaqueState(long nativeAwContents, byte[] state);
 
-    private native int nativeReleasePopupAwContents(long nativeAwContents);
+    private native long nativeReleasePopupAwContents(long nativeAwContents);
     private native void nativeFocusFirstNode(long nativeAwContents);
     private native void nativeSetBackgroundColor(long nativeAwContents, int color);
 
-    private native int nativeGetAwDrawGLViewContext(long nativeAwContents);
     private native long nativeCapturePicture(long nativeAwContents, int width, int height);
     private native void nativeEnableOnNewPicture(long nativeAwContents, boolean enabled);
+    private native void nativeInsertVisualStateCallback(
+            long nativeAwContents, long requestId, VisualStateCallback callback);
     private native void nativeClearView(long nativeAwContents);
     private native void nativeSetExtraHeadersForUrl(long nativeAwContents,
             String url, String extraHeaders);
 
     private native void nativeInvokeGeolocationCallback(
             long nativeAwContents, boolean value, String requestingFrame);
+    private native int nativeGetEffectivePriority(long nativeAwContents);
 
     private native void nativeSetJsOnlineProperty(long nativeAwContents, boolean networkUp);
 
-    private native void nativeTrimMemory(long nativeAwContents, int level);
+    private native void nativeTrimMemory(long nativeAwContents, int level, boolean visible);
 
     private native void nativeCreatePdfExporter(long nativeAwContents, AwPdfExporter awPdfExporter);
+
+    private native void nativePreauthorizePermission(long nativeAwContents, String origin,
+            long resources);
+
+    private native void nativeGrantFileSchemeAccesstoChildProcess(long nativeAwContents);
+    private native void nativeResumeLoadingCreatedPopupWebContents(long nativeAwContents);
 }

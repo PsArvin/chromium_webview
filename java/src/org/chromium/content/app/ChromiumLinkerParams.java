@@ -4,13 +4,18 @@
 
 package org.chromium.content.app;
 
-import android.content.Intent;
+import android.os.Bundle;
+
+import java.util.Locale;
+
+import javax.annotation.concurrent.Immutable;
 
 /**
  * A class to hold information passed from the browser process to each
  * service one when using the chromium linker. For more information, read the
  * technical notes in Linker.java.
  */
+@Immutable
 public class ChromiumLinkerParams {
     // Use this base address to load native shared libraries. If 0, ignore other members.
     public final long mBaseLoadAddress;
@@ -20,56 +25,75 @@ public class ChromiumLinkerParams {
 
     // If not empty, name of Linker.TestRunner implementation that needs to be
     // registered in the service process.
-    public final String mTestRunnerClassName;
+    public final String mTestRunnerClassNameForTesting;
 
     private static final String EXTRA_LINKER_PARAMS_BASE_LOAD_ADDRESS =
-        "org.chromium.content.common.linker_params.base_load_address";
+            "org.chromium.content.common.linker_params.base_load_address";
 
     private static final String EXTRA_LINKER_PARAMS_WAIT_FOR_SHARED_RELRO =
-        "org.chromium.content.common.linker_params.wait_for_shared_relro";
+            "org.chromium.content.common.linker_params.wait_for_shared_relro";
 
     private static final String EXTRA_LINKER_PARAMS_TEST_RUNNER_CLASS_NAME =
-        "org.chromium.content.common.linker_params.test_runner_class_name";
+            "org.chromium.content.common.linker_params.test_runner_class_name";
 
-    public ChromiumLinkerParams(long baseLoadAddress,
-                        boolean waitForSharedRelro,
-                        String testRunnerClassName) {
+    public ChromiumLinkerParams(long baseLoadAddress, boolean waitForSharedRelro) {
         mBaseLoadAddress = baseLoadAddress;
         mWaitForSharedRelro = waitForSharedRelro;
-        mTestRunnerClassName = testRunnerClassName;
+        mTestRunnerClassNameForTesting = null;
     }
 
     /**
-     * Use this constructor to recreate a LinkerParams instance from an Intent.
-     * @param intent An Intent, its content must have been populated by a previous
-     * call to addIntentExtras().
+     * Use this constructor to create a LinkerParams instance for testing.
      */
-    public ChromiumLinkerParams(Intent intent) {
-        mBaseLoadAddress = intent.getLongExtra(EXTRA_LINKER_PARAMS_BASE_LOAD_ADDRESS, 0);
-        mWaitForSharedRelro = intent.getBooleanExtra(
-                EXTRA_LINKER_PARAMS_WAIT_FOR_SHARED_RELRO, false);
-        mTestRunnerClassName = intent.getStringExtra(
-                EXTRA_LINKER_PARAMS_TEST_RUNNER_CLASS_NAME);
+    public ChromiumLinkerParams(
+            long baseLoadAddress, boolean waitForSharedRelro, String testRunnerClassName) {
+        mBaseLoadAddress = baseLoadAddress;
+        mWaitForSharedRelro = waitForSharedRelro;
+        mTestRunnerClassNameForTesting = testRunnerClassName;
     }
 
     /**
-     * Ensure this LinkerParams instance is sent to a service process by adding
-     * it to an intent's extras.
-     * @param intent An Intent use to start or connect to the child service process.
+     * Use this method to recreate a LinkerParams instance from a Bundle.
+     *
+     * @param bundle A Bundle, its content must have been populated by a previous
+     * call to populateBundle().
+     * @return params instance or possibly null if params was not put into bundle.
      */
-    public void addIntentExtras(Intent intent) {
-        intent.putExtra(EXTRA_LINKER_PARAMS_BASE_LOAD_ADDRESS, mBaseLoadAddress);
-        intent.putExtra(EXTRA_LINKER_PARAMS_WAIT_FOR_SHARED_RELRO, mWaitForSharedRelro);
-        intent.putExtra(EXTRA_LINKER_PARAMS_TEST_RUNNER_CLASS_NAME, mTestRunnerClassName);
+    public static ChromiumLinkerParams create(Bundle bundle) {
+        if (!bundle.containsKey(EXTRA_LINKER_PARAMS_BASE_LOAD_ADDRESS)
+                || !bundle.containsKey(EXTRA_LINKER_PARAMS_WAIT_FOR_SHARED_RELRO)
+                || !bundle.containsKey(EXTRA_LINKER_PARAMS_TEST_RUNNER_CLASS_NAME)) {
+            return null;
+        }
+        return new ChromiumLinkerParams(bundle);
+    }
+
+    private ChromiumLinkerParams(Bundle bundle) {
+        mBaseLoadAddress = bundle.getLong(EXTRA_LINKER_PARAMS_BASE_LOAD_ADDRESS, 0);
+        mWaitForSharedRelro = bundle.getBoolean(EXTRA_LINKER_PARAMS_WAIT_FOR_SHARED_RELRO, false);
+        mTestRunnerClassNameForTesting =
+                bundle.getString(EXTRA_LINKER_PARAMS_TEST_RUNNER_CLASS_NAME);
+    }
+
+    /**
+     * Save data in this LinkerParams instance in a bundle, to be sent to a service process.
+     *
+     * @param bundle An bundle to be passed to the child service process.
+     */
+    public void populateBundle(Bundle bundle) {
+        bundle.putLong(EXTRA_LINKER_PARAMS_BASE_LOAD_ADDRESS, mBaseLoadAddress);
+        bundle.putBoolean(EXTRA_LINKER_PARAMS_WAIT_FOR_SHARED_RELRO, mWaitForSharedRelro);
+        bundle.putString(
+                EXTRA_LINKER_PARAMS_TEST_RUNNER_CLASS_NAME, mTestRunnerClassNameForTesting);
     }
 
     // For debugging traces only.
+    @Override
     public String toString() {
-        return String.format(
-                "LinkerParams(baseLoadAddress:0x%x, waitForSharedRelro:%s, " +
-                        "testRunnerClassName:%s",
-                mBaseLoadAddress,
-                mWaitForSharedRelro ? "true" : "false",
-                mTestRunnerClassName);
+        return String.format(Locale.US,
+                "LinkerParams(baseLoadAddress:0x%x, waitForSharedRelro:%s, "
+                        + "testRunnerClassName:%s",
+                mBaseLoadAddress, Boolean.toString(mWaitForSharedRelro),
+                mTestRunnerClassNameForTesting);
     }
 }

@@ -4,6 +4,7 @@
 
 package org.chromium.content.browser;
 
+import android.annotation.SuppressLint;
 import android.content.Context;
 import android.content.res.Resources;
 import android.graphics.Bitmap;
@@ -21,21 +22,24 @@ import android.graphics.Region.Op;
 import android.graphics.drawable.ColorDrawable;
 import android.graphics.drawable.Drawable;
 import android.os.SystemClock;
-import android.util.Log;
 import android.view.GestureDetector;
 import android.view.MotionEvent;
 import android.view.View;
+import android.view.ViewGroup;
 import android.view.animation.Interpolator;
 import android.view.animation.OvershootInterpolator;
 
+import org.chromium.base.ApiCompatibilityUtils;
+import org.chromium.base.Log;
+import org.chromium.base.VisibleForTesting;
+import org.chromium.base.metrics.RecordHistogram;
 import org.chromium.content.R;
 
 /**
- * PopupZoomer is used to show the on-demand link zooming popup. It handles manipulation of the
- * canvas and touch events to display the on-demand zoom magnifier.
+ * {@link View} class that implements tap disambiguation UI.
  */
-class PopupZoomer extends View {
-    private static final String LOGTAG = "PopupZoomer";
+public class PopupZoomer extends View {
+    private static final String TAG = "cr.PopupZoomer";
 
     // The padding between the edges of the view and the popup. Note that there is a mirror
     // constant in content/renderer/render_view_impl.cc which should be kept in sync if
@@ -44,16 +48,31 @@ class PopupZoomer extends View {
     // Time it takes for the animation to finish in ms.
     private static final long ANIMATION_DURATION = 300;
 
-    /**
-     * Interface to be implemented to listen for touch events inside the zoomed area.
-     * The MotionEvent coordinates correspond to original unzoomed view.
-     */
-    public static interface OnTapListener {
-        public boolean onSingleTap(View v, MotionEvent event);
-        public boolean onLongPress(View v, MotionEvent event);
+    // Note that these values should be cross-checked against
+    // tools/metrics/histograms/histograms.xml.  Values should only be appended,
+    // not changed or removed.
+    private static final String UMA_TAPDISAMBIGUATION = "Touchscreen.TapDisambiguation";
+    private static final int UMA_TAPDISAMBIGUATION_OTHER = 0;
+    private static final int UMA_TAPDISAMBIGUATION_BACKBUTTON = 1;
+    private static final int UMA_TAPDISAMBIGUATION_TAPPEDOUTSIDE = 2;
+    private static final int UMA_TAPDISAMBIGUATION_TAPPEDINSIDE_DEPRECATED = 3;
+    private static final int UMA_TAPDISAMBIGUATION_TAPPEDINSIDE_SAMENODE = 4;
+    private static final int UMA_TAPDISAMBIGUATION_TAPPEDINSIDE_DIFFERENTNODE = 5;
+    private static final int UMA_TAPDISAMBIGUATION_COUNT = 6;
+
+    private void recordHistogram(int value) {
+        RecordHistogram.recordEnumeratedHistogram(
+                UMA_TAPDISAMBIGUATION, value, UMA_TAPDISAMBIGUATION_COUNT);
     }
 
-    private OnTapListener mOnTapListener = null;
+    /**
+     * Interface to be implemented to listen for touch events inside the zoomed area.
+     */
+    public static interface OnTapListener {
+        public void onResolveTapDisambiguation(long timeMs, float x, float y, boolean isLongPress);
+    }
+
+    private final OnTapListener mOnTapListener;
 
     /**
      * Interface to be implemented to add and remove PopupZoomer to/from the view hierarchy.
@@ -63,7 +82,7 @@ class PopupZoomer extends View {
         public void onPopupZoomerHidden(PopupZoomer zoomer);
     }
 
-    private OnVisibilityChangedListener mOnVisibilityChangedListener = null;
+    private final OnVisibilityChangedListener mOnVisibilityChangedListener;
 
     // Cached drawable used to frame the zooming popup.
     // TODO(tonyg): This should be marked purgeable so that if the system wants to recover this
@@ -78,14 +97,14 @@ class PopupZoomer extends View {
     private final Interpolator mShowInterpolator = new OvershootInterpolator();
     private final Interpolator mHideInterpolator = new ReverseInterpolator(mShowInterpolator);
 
-    private boolean mAnimating = false;
-    private boolean mShowing = false;
-    private long mAnimationStartTime = 0;
+    private boolean mAnimating;
+    private boolean mShowing;
+    private long mAnimationStartTime;
 
     // The time that was left for the outwards animation to finish.
     // This is used in the case that the zoomer is cancelled while it is still animating outwards,
     // to avoid having it jump to full size then animate closed.
-    private long mTimeLeft = 0;
+    private long mTimeLeft;
 
     // initDimensions() needs to be called in onDraw().
     private boolean mNeedsToInitDimensions;
@@ -101,7 +120,7 @@ class PopupZoomer extends View {
 
     // How far to shift the canvas after all zooming is done, to keep it inside the bounds of the
     // view (including margin).
-    private float mShiftX = 0, mShiftY = 0;
+    private float mShiftX, mShiftY;
     // The magnification factor of the popup. It is recomputed once we have mTargetBounds and
     // mZoomedBitmap.
     private float mScale = 1.0f;
@@ -120,7 +139,11 @@ class PopupZoomer extends View {
     private float mMinScrollX, mMaxScrollX;
     private float mMinScrollY, mMaxScrollY;
 
-    private GestureDetector mGestureDetector;
+    private final GestureDetector mGestureDetector;
+
+    // These bounds are computed and valid for one execution of onDraw.
+    // Extracted to a member variable to save unnecessary allocations on each invocation.
+    private RectF mDrawRect;
 
     private static float getOverlayCornerRadius(Context context) {
         if (sOverlayCornerRadius == 0) {
@@ -128,7 +151,7 @@ class PopupZoomer extends View {
                 sOverlayCornerRadius = context.getResources().getDimension(
                         R.dimen.link_preview_overlay_radius);
             } catch (Resources.NotFoundException e) {
-                Log.w(LOGTAG, "No corner radius resource for PopupZoomer overlay found.");
+                Log.w(TAG, "No corner radius resource for PopupZoomer overlay found.");
                 sOverlayCornerRadius = 1.0f;
             }
         }
@@ -142,10 +165,10 @@ class PopupZoomer extends View {
     private static Drawable getOverlayDrawable(Context context) {
         if (sOverlayDrawable == null) {
             try {
-                sOverlayDrawable = context.getResources().getDrawable(
+                sOverlayDrawable = ApiCompatibilityUtils.getDrawable(context.getResources(),
                         R.drawable.ondemand_overlay);
             } catch (Resources.NotFoundException e) {
-                Log.w(LOGTAG, "No drawable resource for PopupZoomer overlay found.");
+                Log.w(TAG, "No drawable resource for PopupZoomer overlay found.");
                 sOverlayDrawable = new ColorDrawable();
             }
             sOverlayPadding = new Rect();
@@ -165,10 +188,16 @@ class PopupZoomer extends View {
     /**
      * Creates Popupzoomer.
      * @param context Context to be used.
-     * @param overlayRadiusDimensoinResId Resource to be used to get overlay corner radius.
+     * @param containerView view that popup zoomer gets added to.
+     * @param visibilityListener {@link OnVisibilityChangedListener} listener.
+     * @param tapListener {@link OnTapListener} listener.
      */
-    public PopupZoomer(Context context) {
+    public PopupZoomer(Context context, ViewGroup containerView,
+            OnVisibilityChangedListener visibilityListener, OnTapListener tapListener) {
         super(context);
+
+        mOnVisibilityChangedListener = visibilityListener;
+        mOnTapListener = tapListener;
 
         setVisibility(INVISIBLE);
         setFocusable(true);
@@ -182,7 +211,7 @@ class PopupZoomer extends View {
                         if (mAnimating) return true;
 
                         if (isTouchOutsideArea(e1.getX(), e1.getY())) {
-                            hide(true);
+                            tappedOutside();
                         } else {
                             scroll(distanceX, distanceY);
                         }
@@ -205,18 +234,12 @@ class PopupZoomer extends View {
                         float x = e.getX();
                         float y = e.getY();
                         if (isTouchOutsideArea(x, y)) {
-                            // User clicked on area outside the popup.
-                            hide(true);
+                            tappedOutside();
                         } else if (mOnTapListener != null) {
                             PointF converted = convertTouchPoint(x, y);
-                            MotionEvent event = MotionEvent.obtainNoHistory(e);
-                            event.setLocation(converted.x, converted.y);
-                            if (isLongPress) {
-                                mOnTapListener.onLongPress(PopupZoomer.this, event);
-                            } else {
-                                mOnTapListener.onSingleTap(PopupZoomer.this, event);
-                            }
-                            hide(true);
+                            mOnTapListener.onResolveTapDisambiguation(
+                                    e.getEventTime(), converted.x, converted.y, isLongPress);
+                            tappedInside();
                         }
                         return true;
                     }
@@ -225,23 +248,10 @@ class PopupZoomer extends View {
     }
 
     /**
-     * Sets the OnTapListener.
-     */
-    public void setOnTapListener(OnTapListener listener) {
-        mOnTapListener = listener;
-    }
-
-    /**
-     * Sets the OnVisibilityChangedListener.
-     */
-    public void setOnVisibilityChangedListener(OnVisibilityChangedListener listener) {
-        mOnVisibilityChangedListener = listener;
-    }
-
-    /**
      * Sets the bitmap to be used for the zoomed view.
      */
-    public void setBitmap(Bitmap bitmap) {
+    @VisibleForTesting
+    void setBitmap(Bitmap bitmap) {
         if (mZoomedBitmap != null) {
             mZoomedBitmap.recycle();
             mZoomedBitmap = null;
@@ -401,6 +411,9 @@ class PopupZoomer extends View {
         // Constrain initial scroll position within allowed bounds.
         mPopupScrollX = constrain(mPopupScrollX, mMinScrollX, mMaxScrollX);
         mPopupScrollY = constrain(mPopupScrollY, mMinScrollY, mMaxScrollY);
+
+        // Compute the bounds in onDraw()
+        mDrawRect = new RectF();
     }
 
     /*
@@ -422,8 +435,8 @@ class PopupZoomer extends View {
 
         canvas.save();
         // Calculate the elapsed fraction of animation.
-        float time = (SystemClock.uptimeMillis() - mAnimationStartTime + mTimeLeft) /
-                ((float) ANIMATION_DURATION);
+        float time = (SystemClock.uptimeMillis() - mAnimationStartTime + mTimeLeft)
+                / ((float) ANIMATION_DURATION);
         time = constrain(time, 0, 1);
         if (time >= 1) {
             mAnimating = false;
@@ -462,26 +475,25 @@ class PopupZoomer extends View {
         float unshiftX = -mShiftX * (1.0f - fractionAnimation) / mScale;
         float unshiftY = -mShiftY * (1.0f - fractionAnimation) / mScale;
 
-        // Compute the rect to show.
-        RectF rect = new RectF();
-        rect.left = mTouch.x - mLeftExtrusion * scale + unshiftX;
-        rect.top = mTouch.y - mTopExtrusion * scale + unshiftY;
-        rect.right = mTouch.x + mRightExtrusion * scale + unshiftX;
-        rect.bottom = mTouch.y + mBottomExtrusion * scale + unshiftY;
-        canvas.clipRect(rect);
+        // Compute the |mDrawRect| to show.
+        mDrawRect.left = mTouch.x - mLeftExtrusion * scale + unshiftX;
+        mDrawRect.top = mTouch.y - mTopExtrusion * scale + unshiftY;
+        mDrawRect.right = mTouch.x + mRightExtrusion * scale + unshiftX;
+        mDrawRect.bottom = mTouch.y + mBottomExtrusion * scale + unshiftY;
+        canvas.clipRect(mDrawRect);
 
         // Since the canvas transform APIs all pre-concat the transformations, this is done in
         // reverse order. The canvas is first scaled up, then shifted the appropriate amount of
         // pixels.
-        canvas.scale(scale, scale, rect.left, rect.top);
+        canvas.scale(scale, scale, mDrawRect.left, mDrawRect.top);
         canvas.translate(mPopupScrollX, mPopupScrollY);
-        canvas.drawBitmap(mZoomedBitmap, rect.left, rect.top, null);
+        canvas.drawBitmap(mZoomedBitmap, mDrawRect.left, mDrawRect.top, null);
         canvas.restore();
         Drawable overlayNineTile = getOverlayDrawable(getContext());
-        overlayNineTile.setBounds((int) rect.left - sOverlayPadding.left,
-                (int) rect.top - sOverlayPadding.top,
-                (int) rect.right + sOverlayPadding.right,
-                (int) rect.bottom + sOverlayPadding.bottom);
+        overlayNineTile.setBounds((int) mDrawRect.left - sOverlayPadding.left,
+                (int) mDrawRect.top - sOverlayPadding.top,
+                (int) mDrawRect.right + sOverlayPadding.right,
+                (int) mDrawRect.bottom + sOverlayPadding.bottom);
         // TODO(nileshagrawal): We should use time here instead of fractionAnimation
         // as fractionAnimaton is interpolated and can go over 1.
         int alpha = constrain((int) (fractionAnimation * 255), 0, 255);
@@ -493,7 +505,8 @@ class PopupZoomer extends View {
     /**
      * Show the PopupZoomer view with given target bounds.
      */
-    public void show(Rect rect) {
+    @VisibleForTesting
+    void show(Rect rect) {
         if (mShowing || mZoomedBitmap == null) return;
 
         setTargetBounds(rect);
@@ -501,17 +514,41 @@ class PopupZoomer extends View {
     }
 
     /**
-     * Hide the PopupZoomer view.
+     * Hide the PopupZoomer view because of some external event such as focus
+     * change, JS-originating scroll, etc.
      * @param animation true if hide with animation.
      */
     public void hide(boolean animation) {
         if (!mShowing) return;
+        recordHistogram(UMA_TAPDISAMBIGUATION_OTHER);
 
         if (animation) {
             startAnimation(false);
         } else {
             hideImmediately();
         }
+    }
+
+    private void tappedInside() {
+        if (!mShowing) return;
+        // Tapped-inside histogram value is recorded on the renderer side,
+        // not here.
+
+        startAnimation(false);
+    }
+
+    private void tappedOutside() {
+        if (!mShowing) return;
+        recordHistogram(UMA_TAPDISAMBIGUATION_TAPPEDOUTSIDE);
+
+        startAnimation(false);
+    }
+
+    public void backButtonPressed() {
+        if (!mShowing) return;
+        recordHistogram(UMA_TAPDISAMBIGUATION_BACKBUTTON);
+
+        startAnimation(false);
     }
 
     /**
@@ -532,6 +569,7 @@ class PopupZoomer extends View {
         return !mClipRect.contains(x, y);
     }
 
+    @SuppressLint("ClickableViewAccessibility")
     @Override
     public boolean onTouchEvent(MotionEvent event) {
         mGestureDetector.onTouchEvent(event);

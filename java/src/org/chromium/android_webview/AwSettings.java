@@ -6,37 +6,59 @@ package org.chromium.android_webview;
 
 import android.content.Context;
 import android.content.pm.PackageManager;
+import android.os.Build;
 import android.os.Handler;
 import android.os.Message;
 import android.os.Process;
 import android.provider.Settings;
+import android.support.annotation.IntDef;
 import android.util.Log;
 import android.webkit.WebSettings;
-import android.webkit.WebSettings.PluginState;
 
-import org.chromium.base.CalledByNative;
-import org.chromium.base.JNINamespace;
 import org.chromium.base.ThreadUtils;
+import org.chromium.base.VisibleForTesting;
+import org.chromium.base.annotations.CalledByNative;
+import org.chromium.base.annotations.JNINamespace;
+import org.chromium.content_public.browser.WebContents;
+
+import java.lang.annotation.Retention;
+import java.lang.annotation.RetentionPolicy;
 
 /**
  * Stores Android WebView specific settings that does not need to be synced to WebKit.
- * Use {@link org.chromium.content.browser.ContentSettings} for WebKit settings.
  *
  * Methods in this class can be called from any thread, including threads created by
  * the client of WebView.
  */
 @JNINamespace("android_webview")
 public class AwSettings {
-    // This enum corresponds to WebSettings.LayoutAlgorithm. We use our own to be
-    // able to extend it.
-    public enum LayoutAlgorithm {
-        NORMAL,
-        SINGLE_COLUMN,
-        NARROW_COLUMNS,
-        TEXT_AUTOSIZING,
-    }
+    private static final String LOGTAG = AwSettings.class.getSimpleName();
+    private static final boolean TRACE = false;
 
     private static final String TAG = "AwSettings";
+
+    /* See {@link android.webkit.WebSettings}. */
+    @Retention(RetentionPolicy.SOURCE)
+    @IntDef({LAYOUT_ALGORITHM_NORMAL,
+            /* See {@link android.webkit.WebSettings}. */
+            LAYOUT_ALGORITHM_SINGLE_COLUMN,
+            /* See {@link android.webkit.WebSettings}. */
+            LAYOUT_ALGORITHM_NARROW_COLUMNS, LAYOUT_ALGORITHM_TEXT_AUTOSIZING})
+    public @interface LayoutAlgorithm {}
+    public static final int LAYOUT_ALGORITHM_NORMAL = 0;
+    /* See {@link android.webkit.WebSettings}. */
+    public static final int LAYOUT_ALGORITHM_SINGLE_COLUMN = 1;
+    /* See {@link android.webkit.WebSettings}. */
+    public static final int LAYOUT_ALGORITHM_NARROW_COLUMNS = 2;
+    public static final int LAYOUT_ALGORITHM_TEXT_AUTOSIZING = 3;
+
+    /* See {@link android.webkit.WebSettings}. */
+    @Retention(RetentionPolicy.SOURCE)
+    @IntDef({PLUGIN_STATE_ON, PLUGIN_STATE_ON_DEMAND, PLUGIN_STATE_OFF})
+    public @interface PluginState {}
+    public static final int PLUGIN_STATE_ON = 0;
+    public static final int PLUGIN_STATE_ON_DEMAND = 1;
+    public static final int PLUGIN_STATE_OFF = 2;
 
     // This class must be created on the UI thread. Afterwards, it can be
     // used from any thread. Internally, the class uses a message queue
@@ -51,7 +73,8 @@ public class AwSettings {
     // Lock to protect all settings.
     private final Object mAwSettingsLock = new Object();
 
-    private LayoutAlgorithm mLayoutAlgorithm = LayoutAlgorithm.NARROW_COLUMNS;
+    @LayoutAlgorithm
+    private int mLayoutAlgorithm = LAYOUT_ALGORITHM_NARROW_COLUMNS;
     private int mTextSizePercent = 100;
     private String mStandardFontFamily = "sans-serif";
     private String mFixedFontFamily = "monospace";
@@ -59,7 +82,7 @@ public class AwSettings {
     private String mSerifFontFamily = "serif";
     private String mCursiveFontFamily = "cursive";
     private String mFantasyFontFamily = "fantasy";
-    private String mDefaultTextEncoding;
+    private String mDefaultTextEncoding = "UTF-8";
     private String mUserAgent;
     private int mMinimumFontSize = 8;
     private int mMinimumLogicalFontSize = 8;
@@ -67,24 +90,41 @@ public class AwSettings {
     private int mDefaultFixedFontSize = 13;
     private boolean mLoadsImagesAutomatically = true;
     private boolean mImagesEnabled = true;
-    private boolean mJavaScriptEnabled = false;
-    private boolean mAllowUniversalAccessFromFileURLs = false;
-    private boolean mAllowFileAccessFromFileURLs = false;
-    private boolean mJavaScriptCanOpenWindowsAutomatically = false;
-    private boolean mSupportMultipleWindows = false;
-    private PluginState mPluginState = PluginState.OFF;
-    private boolean mAppCacheEnabled = false;
-    private boolean mDomStorageEnabled = false;
-    private boolean mDatabaseEnabled = false;
-    private boolean mUseWideViewport = false;
-    private boolean mLoadWithOverviewMode = false;
+    private boolean mJavaScriptEnabled;
+    private boolean mAllowUniversalAccessFromFileURLs;
+    private boolean mAllowFileAccessFromFileURLs;
+    private boolean mJavaScriptCanOpenWindowsAutomatically;
+    private boolean mSupportMultipleWindows;
+    private @PluginState int mPluginState = PLUGIN_STATE_OFF;
+    private boolean mAppCacheEnabled;
+    private boolean mDomStorageEnabled;
+    private boolean mDatabaseEnabled;
+    private boolean mUseWideViewport;
+    private boolean mZeroLayoutHeightDisablesViewportQuirk;
+    private boolean mForceZeroLayoutHeight;
+    private boolean mLoadWithOverviewMode;
     private boolean mMediaPlaybackRequiresUserGesture = true;
     private String mDefaultVideoPosterURL;
-    private float mInitialPageScalePercent = 0;
+    private float mInitialPageScalePercent;
     private boolean mSpatialNavigationEnabled;  // Default depends on device features.
-    private boolean mEnableSupportedHardwareAcceleratedFeatures = false;
+    private boolean mEnableSupportedHardwareAcceleratedFeatures;
+    private int mMixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW;
+    private boolean mCSSHexAlphaColorEnabled = false;
+    private boolean mScrollTopLeftInteropEnabled = false;
+
+    private boolean mOffscreenPreRaster;
+    private int mDisabledMenuItems = WebSettings.MENU_ITEM_NONE;
+
+    // Although this bit is stored on AwSettings it is actually controlled via the CookieManager.
+    private boolean mAcceptThirdPartyCookies;
+
+    // if null, default to AwContentsStatics.getSafeBrowsingEnabledByManifest()
+    private Boolean mSafeBrowsingEnabled;
 
     private final boolean mSupportLegacyQuirks;
+    private final boolean mAllowEmptyDocumentPersistence;
+    private final boolean mAllowGeolocationOnInsecureOrigins;
+    private final boolean mDoNotUpdateSelectionOnMutatingSelectionRange;
 
     private final boolean mPasswordEchoEnabled;
 
@@ -95,9 +135,10 @@ public class AwSettings {
     private int mCacheMode = WebSettings.LOAD_DEFAULT;
     private boolean mShouldFocusFirstNode = true;
     private boolean mGeolocationEnabled = true;
-    private boolean mAutoCompleteEnabled = true;
+    private boolean mAutoCompleteEnabled = Build.VERSION.SDK_INT < Build.VERSION_CODES.O;
+    private boolean mFullscreenSupported;
     private boolean mSupportZoom = true;
-    private boolean mBuiltInZoomControls = false;
+    private boolean mBuiltInZoomControls;
     private boolean mDisplayZoomControls = true;
 
     static class LazyDefaultUserAgent{
@@ -110,10 +151,10 @@ public class AwSettings {
     // For compatibility with the legacy WebView, we can only enable AppCache when the path is
     // provided. However, we don't use the path, so we just check if we have received it from the
     // client.
-    private static boolean sAppCachePathIsSet = false;
+    private static boolean sAppCachePathIsSet;
 
     // The native side of this object. It's lifetime is bounded by the WebContent it is attached to.
-    private long mNativeAwSettings = 0;
+    private long mNativeAwSettings;
 
     // Custom handler that queues messages to call native code on the UI thread.
     private final EventHandler mEventHandler;
@@ -128,7 +169,7 @@ public class AwSettings {
         // Actual UI thread handler
         private Handler mHandler;
         // Synchronization flag.
-        private boolean mSynchronizationPending = false;
+        private boolean mSynchronizationPending;
 
         EventHandler() {
         }
@@ -142,7 +183,7 @@ public class AwSettings {
                         case RUN_RUNNABLE_BLOCKING:
                             synchronized (mAwSettingsLock) {
                                 if (mNativeAwSettings != 0) {
-                                    ((Runnable)msg.obj).run();
+                                    ((Runnable) msg.obj).run();
                                 }
                                 mSynchronizationPending = false;
                                 mAwSettingsLock.notifyAll();
@@ -180,12 +221,7 @@ public class AwSettings {
         }
 
         void updateWebkitPreferencesLocked() {
-            runOnUiThreadBlockingAndLocked(new Runnable() {
-                @Override
-                public void run() {
-                    updateWebkitPreferencesOnUiThreadLocked();
-                }
-            });
+            runOnUiThreadBlockingAndLocked(() -> updateWebkitPreferencesOnUiThreadLocked());
         }
     }
 
@@ -194,13 +230,14 @@ public class AwSettings {
                 boolean supportsDoubleTapZoom, boolean supportsMultiTouchZoom);
     }
 
-    public AwSettings(Context context,
-            boolean isAccessFromFileURLsGrantedByDefault,
-            boolean supportsLegacyQuirks) {
-       boolean hasInternetPermission = context.checkPermission(
-                    android.Manifest.permission.INTERNET,
-                    Process.myPid(),
-                    Process.myUid()) == PackageManager.PERMISSION_GRANTED;
+    public AwSettings(Context context, boolean isAccessFromFileURLsGrantedByDefault,
+            boolean supportsLegacyQuirks, boolean allowEmptyDocumentPersistence,
+            boolean allowGeolocationOnInsecureOrigins,
+            boolean doNotUpdateSelectionOnMutatingSelectionRange) {
+        boolean hasInternetPermission = context.checkPermission(
+                android.Manifest.permission.INTERNET,
+                Process.myPid(),
+                Process.myUid()) == PackageManager.PERMISSION_GRANTED;
         synchronized (mAwSettingsLock) {
             mHasInternetPermission = hasInternetPermission;
             mBlockNetworkLoads = !hasInternetPermission;
@@ -210,7 +247,6 @@ public class AwSettings {
                 mAllowFileAccessFromFileURLs = true;
             }
 
-            mDefaultTextEncoding = AwResource.getDefaultTextEncoding();
             mUserAgent = LazyDefaultUserAgent.sInstance;
 
             // Best-guess a sensible initial value based on the features supported on the device.
@@ -223,9 +259,14 @@ public class AwSettings {
 
             // By default, scale the text size by the system font scale factor. Embedders
             // may override this by invoking setTextZoom().
-            mTextSizePercent *= context.getResources().getConfiguration().fontScale;
+            mTextSizePercent =
+                    (int) (mTextSizePercent * context.getResources().getConfiguration().fontScale);
 
             mSupportLegacyQuirks = supportsLegacyQuirks;
+            mAllowEmptyDocumentPersistence = allowEmptyDocumentPersistence;
+            mAllowGeolocationOnInsecureOrigins = allowGeolocationOnInsecureOrigins;
+            mDoNotUpdateSelectionOnMutatingSelectionRange =
+                    doNotUpdateSelectionOnMutatingSelectionRange;
         }
         // Defer initializing the native side until a native WebContents instance is set.
     }
@@ -256,30 +297,37 @@ public class AwSettings {
         }
     }
 
-    void setWebContents(int nativeWebContents) {
+    void setWebContents(WebContents webContents) {
         synchronized (mAwSettingsLock) {
             if (mNativeAwSettings != 0) {
                 nativeDestroy(mNativeAwSettings);
                 assert mNativeAwSettings == 0;  // nativeAwSettingsGone should have been called.
             }
-            if (nativeWebContents != 0) {
+            if (webContents != null) {
                 mEventHandler.bindUiThread();
-                mNativeAwSettings = nativeInit(nativeWebContents);
-                nativeUpdateEverythingLocked(mNativeAwSettings);
-                onGestureZoomSupportChanged(
-                        supportsDoubleTapZoomLocked(), supportsMultiTouchZoomLocked());
+                mNativeAwSettings = nativeInit(webContents);
+                updateEverythingLocked();
             }
         }
+    }
+
+    private void updateEverythingLocked() {
+        assert Thread.holdsLock(mAwSettingsLock);
+        assert mNativeAwSettings != 0;
+        nativeUpdateEverythingLocked(mNativeAwSettings);
+        onGestureZoomSupportChanged(
+                supportsDoubleTapZoomLocked(), supportsMultiTouchZoomLocked());
     }
 
     /**
      * See {@link android.webkit.WebSettings#setBlockNetworkLoads}.
      */
     public void setBlockNetworkLoads(boolean flag) {
+        if (TRACE) Log.i(LOGTAG, "setBlockNetworkLoads=" + flag);
         synchronized (mAwSettingsLock) {
             if (!flag && !mHasInternetPermission) {
-                throw new SecurityException("Permission denied - " +
-                        "application missing INTERNET permission");
+                throw new SecurityException("Permission denied - "
+                        + "application missing INTERNET permission");
             }
             mBlockNetworkLoads = flag;
         }
@@ -295,13 +343,62 @@ public class AwSettings {
     }
 
     /**
+     * Enable/disable third party cookies for an AwContents
+     * @param accept true if we should accept third party cookies
+     */
+    public void setAcceptThirdPartyCookies(boolean accept) {
+        if (TRACE) Log.i(LOGTAG, "setAcceptThirdPartyCookies=" + accept);
+        synchronized (mAwSettingsLock) {
+            mAcceptThirdPartyCookies = accept;
+        }
+    }
+
+    /**
+     * Enable/Disable SafeBrowsing per WebView
+     * @param enabled true if this WebView should have SafeBrowsing
+     */
+    public void setSafeBrowsingEnabled(boolean enabled) {
+        synchronized (mAwSettingsLock) {
+            mSafeBrowsingEnabled = enabled;
+        }
+    }
+
+    /**
+     * Return whether third party cookies are enabled for an AwContents
+     * @return true if accept third party cookies
+     */
+    public boolean getAcceptThirdPartyCookies() {
+        synchronized (mAwSettingsLock) {
+            return mAcceptThirdPartyCookies;
+        }
+    }
+
+    /**
+     * Return whether Safe Browsing has been enabled for the current WebView
+     * @return true if SafeBrowsing is enabled
+     */
+    public boolean getSafeBrowsingEnabled() {
+        synchronized (mAwSettingsLock) {
+            Boolean userOptIn = AwSafeBrowsingConfigHelper.getSafeBrowsingUserOptIn();
+
+            // If we don't know yet what the user's preference is, we go through Safe Browsing logic
+            // anyway and correct the assumption before sending data to GMS.
+            if (userOptIn != null && !userOptIn) return false;
+
+            if (mSafeBrowsingEnabled == null) {
+                return AwContentsStatics.getSafeBrowsingEnabledByManifest();
+            }
+            return mSafeBrowsingEnabled;
+        }
+    }
+
+    /**
      * See {@link android.webkit.WebSettings#setAllowFileAccess}.
      */
     public void setAllowFileAccess(boolean allow) {
+        if (TRACE) Log.i(LOGTAG, "setAllowFileAccess=" + allow);
         synchronized (mAwSettingsLock) {
-            if (mAllowFileUrlAccess != allow) {
-                mAllowFileUrlAccess = allow;
-            }
+            mAllowFileUrlAccess = allow;
         }
     }
 
@@ -318,10 +415,9 @@ public class AwSettings {
      * See {@link android.webkit.WebSettings#setAllowContentAccess}.
      */
     public void setAllowContentAccess(boolean allow) {
+        if (TRACE) Log.i(LOGTAG, "setAllowContentAccess=" + allow);
         synchronized (mAwSettingsLock) {
-            if (mAllowContentUrlAccess != allow) {
-                mAllowContentUrlAccess = allow;
-            }
+            mAllowContentUrlAccess = allow;
         }
     }
 
@@ -338,10 +434,9 @@ public class AwSettings {
      * See {@link android.webkit.WebSettings#setCacheMode}.
      */
     public void setCacheMode(int mode) {
+        if (TRACE) Log.i(LOGTAG, "setCacheMode=" + mode);
         synchronized (mAwSettingsLock) {
-            if (mCacheMode != mode) {
-                mCacheMode = mode;
-            }
+            mCacheMode = mode;
         }
     }
 
@@ -358,6 +453,7 @@ public class AwSettings {
      * See {@link android.webkit.WebSettings#setNeedInitialFocus}.
      */
     public void setShouldFocusFirstNode(boolean flag) {
+        if (TRACE) Log.i(LOGTAG, "setNeedInitialFocusNode=" + flag);
         synchronized (mAwSettingsLock) {
             mShouldFocusFirstNode = flag;
         }
@@ -367,12 +463,12 @@ public class AwSettings {
      * See {@link android.webkit.WebView#setInitialScale}.
      */
     public void setInitialPageScale(final float scaleInPercent) {
+        if (TRACE) Log.i(LOGTAG, "setInitialScale=" + scaleInPercent);
         synchronized (mAwSettingsLock) {
             if (mInitialPageScalePercent != scaleInPercent) {
                 mInitialPageScalePercent = scaleInPercent;
-                mEventHandler.runOnUiThreadBlockingAndLocked(new Runnable() {
-                    @Override
-                    public void run() {
+                mEventHandler.runOnUiThreadBlockingAndLocked(() -> {
+                    if (mNativeAwSettings != 0) {
                         nativeUpdateInitialPageScaleLocked(mNativeAwSettings);
                     }
                 });
@@ -416,6 +512,21 @@ public class AwSettings {
         return mEnableSupportedHardwareAcceleratedFeatures;
     }
 
+    public void setFullscreenSupported(boolean supported) {
+        synchronized (mAwSettingsLock) {
+            if (mFullscreenSupported != supported) {
+                mFullscreenSupported = supported;
+                mEventHandler.updateWebkitPreferencesLocked();
+            }
+        }
+    }
+
+    @CalledByNative
+    private boolean getFullscreenSupportedLocked() {
+        assert Thread.holdsLock(mAwSettingsLock);
+        return mFullscreenSupported;
+    }
+
     /**
      * See {@link android.webkit.WebSettings#setNeedInitialFocus}.
      */
@@ -429,10 +540,9 @@ public class AwSettings {
      * See {@link android.webkit.WebSettings#setGeolocationEnabled}.
      */
     public void setGeolocationEnabled(boolean flag) {
+        if (TRACE) Log.i(LOGTAG, "setGeolocationEnabled=" + flag);
         synchronized (mAwSettingsLock) {
-            if (mGeolocationEnabled != flag) {
-                mGeolocationEnabled = flag;
-            }
+            mGeolocationEnabled = flag;
         }
     }
 
@@ -449,12 +559,12 @@ public class AwSettings {
      * See {@link android.webkit.WebSettings#setSaveFormData}.
      */
     public void setSaveFormData(final boolean enable) {
+        if (TRACE) Log.i(LOGTAG, "setSaveFormData=" + enable);
         synchronized (mAwSettingsLock) {
             if (mAutoCompleteEnabled != enable) {
                 mAutoCompleteEnabled = enable;
-                mEventHandler.runOnUiThreadBlockingAndLocked(new Runnable() {
-                    @Override
-                    public void run() {
+                mEventHandler.runOnUiThreadBlockingAndLocked(() -> {
+                    if (mNativeAwSettings != 0) {
                         nativeUpdateFormDataPreferencesLocked(mNativeAwSettings);
                     }
                 });
@@ -477,6 +587,15 @@ public class AwSettings {
         return mAutoCompleteEnabled;
     }
 
+    public void setUserAgent(int ua) {
+        // Minimal implementation for backwards compatibility: just supports resetting to default.
+        if (ua == 0) {
+            setUserAgentString(null);
+        } else {
+            Log.w(LOGTAG, "setUserAgent not supported, ua=" + ua);
+        }
+    }
+
     /**
      * @returns the default User-Agent used by each ContentViewCore instance, i.e. unless
      * overridden by {@link #setUserAgentString()}
@@ -489,6 +608,7 @@ public class AwSettings {
      * See {@link android.webkit.WebSettings#setUserAgentString}.
      */
     public void setUserAgentString(String ua) {
+        if (TRACE) Log.i(LOGTAG, "setUserAgentString=" + ua);
         synchronized (mAwSettingsLock) {
             final String oldUserAgent = mUserAgent;
             if (ua == null || ua.length() == 0) {
@@ -497,9 +617,8 @@ public class AwSettings {
                 mUserAgent = ua;
             }
             if (!oldUserAgent.equals(mUserAgent)) {
-                mEventHandler.runOnUiThreadBlockingAndLocked(new Runnable() {
-                    @Override
-                    public void run() {
+                mEventHandler.runOnUiThreadBlockingAndLocked(() -> {
+                    if (mNativeAwSettings != 0) {
                         nativeUpdateUserAgentLocked(mNativeAwSettings);
                     }
                 });
@@ -512,7 +631,7 @@ public class AwSettings {
      */
     public String getUserAgentString() {
         synchronized (mAwSettingsLock) {
-            return mUserAgent;
+            return getUserAgentLocked();
         }
     }
 
@@ -526,12 +645,12 @@ public class AwSettings {
      * See {@link android.webkit.WebSettings#setLoadWithOverviewMode}.
      */
     public void setLoadWithOverviewMode(boolean overview) {
+        if (TRACE) Log.i(LOGTAG, "setLoadWithOverviewMode=" + overview);
         synchronized (mAwSettingsLock) {
             if (mLoadWithOverviewMode != overview) {
                 mLoadWithOverviewMode = overview;
-                mEventHandler.runOnUiThreadBlockingAndLocked(new Runnable() {
-                    @Override
-                    public void run() {
+                mEventHandler.runOnUiThreadBlockingAndLocked(() -> {
+                    if (mNativeAwSettings != 0) {
                         updateWebkitPreferencesOnUiThreadLocked();
                         nativeResetScrollAndScaleState(mNativeAwSettings);
                     }
@@ -545,7 +664,7 @@ public class AwSettings {
      */
     public boolean getLoadWithOverviewMode() {
         synchronized (mAwSettingsLock) {
-            return mLoadWithOverviewMode;
+            return getLoadWithOverviewModeLocked();
         }
     }
 
@@ -559,6 +678,7 @@ public class AwSettings {
      * See {@link android.webkit.WebSettings#setTextZoom}.
      */
     public void setTextZoom(final int textZoom) {
+        if (TRACE) Log.i(LOGTAG, "setTextZoom=" + textZoom);
         synchronized (mAwSettingsLock) {
             if (mTextSizePercent != textZoom) {
                 mTextSizePercent = textZoom;
@@ -572,7 +692,7 @@ public class AwSettings {
      */
     public int getTextZoom() {
         synchronized (mAwSettingsLock) {
-            return mTextSizePercent;
+            return getTextSizePercentLocked();
         }
     }
 
@@ -586,6 +706,7 @@ public class AwSettings {
      * See {@link android.webkit.WebSettings#setStandardFontFamily}.
      */
     public void setStandardFontFamily(String font) {
+        if (TRACE) Log.i(LOGTAG, "setStandardFontFamily=" + font);
         synchronized (mAwSettingsLock) {
             if (font != null && !mStandardFontFamily.equals(font)) {
                 mStandardFontFamily = font;
@@ -599,7 +720,7 @@ public class AwSettings {
      */
     public String getStandardFontFamily() {
         synchronized (mAwSettingsLock) {
-            return mStandardFontFamily;
+            return getStandardFontFamilyLocked();
         }
     }
 
@@ -613,6 +734,7 @@ public class AwSettings {
      * See {@link android.webkit.WebSettings#setFixedFontFamily}.
      */
     public void setFixedFontFamily(String font) {
+        if (TRACE) Log.i(LOGTAG, "setFixedFontFamily=" + font);
         synchronized (mAwSettingsLock) {
             if (font != null && !mFixedFontFamily.equals(font)) {
                 mFixedFontFamily = font;
@@ -626,7 +748,7 @@ public class AwSettings {
      */
     public String getFixedFontFamily() {
         synchronized (mAwSettingsLock) {
-            return mFixedFontFamily;
+            return getFixedFontFamilyLocked();
         }
     }
 
@@ -640,6 +762,7 @@ public class AwSettings {
      * See {@link android.webkit.WebSettings#setSansSerifFontFamily}.
      */
     public void setSansSerifFontFamily(String font) {
+        if (TRACE) Log.i(LOGTAG, "setSansSerifFontFamily=" + font);
         synchronized (mAwSettingsLock) {
             if (font != null && !mSansSerifFontFamily.equals(font)) {
                 mSansSerifFontFamily = font;
@@ -653,7 +776,7 @@ public class AwSettings {
      */
     public String getSansSerifFontFamily() {
         synchronized (mAwSettingsLock) {
-            return mSansSerifFontFamily;
+            return getSansSerifFontFamilyLocked();
         }
     }
 
@@ -667,6 +790,7 @@ public class AwSettings {
      * See {@link android.webkit.WebSettings#setSerifFontFamily}.
      */
     public void setSerifFontFamily(String font) {
+        if (TRACE) Log.i(LOGTAG, "setSerifFontFamily=" + font);
         synchronized (mAwSettingsLock) {
             if (font != null && !mSerifFontFamily.equals(font)) {
                 mSerifFontFamily = font;
@@ -680,7 +804,7 @@ public class AwSettings {
      */
     public String getSerifFontFamily() {
         synchronized (mAwSettingsLock) {
-            return mSerifFontFamily;
+            return getSerifFontFamilyLocked();
         }
     }
 
@@ -694,6 +818,7 @@ public class AwSettings {
      * See {@link android.webkit.WebSettings#setCursiveFontFamily}.
      */
     public void setCursiveFontFamily(String font) {
+        if (TRACE) Log.i(LOGTAG, "setCursiveFontFamily=" + font);
         synchronized (mAwSettingsLock) {
             if (font != null && !mCursiveFontFamily.equals(font)) {
                 mCursiveFontFamily = font;
@@ -707,7 +832,7 @@ public class AwSettings {
      */
     public String getCursiveFontFamily() {
         synchronized (mAwSettingsLock) {
-            return mCursiveFontFamily;
+            return getCursiveFontFamilyLocked();
         }
     }
 
@@ -721,6 +846,7 @@ public class AwSettings {
      * See {@link android.webkit.WebSettings#setFantasyFontFamily}.
      */
     public void setFantasyFontFamily(String font) {
+        if (TRACE) Log.i(LOGTAG, "setFantasyFontFamily=" + font);
         synchronized (mAwSettingsLock) {
             if (font != null && !mFantasyFontFamily.equals(font)) {
                 mFantasyFontFamily = font;
@@ -734,7 +860,7 @@ public class AwSettings {
      */
     public String getFantasyFontFamily() {
         synchronized (mAwSettingsLock) {
-            return mFantasyFontFamily;
+            return getFantasyFontFamilyLocked();
         }
     }
 
@@ -748,6 +874,7 @@ public class AwSettings {
      * See {@link android.webkit.WebSettings#setMinimumFontSize}.
      */
     public void setMinimumFontSize(int size) {
+        if (TRACE) Log.i(LOGTAG, "setMinimumFontSize=" + size);
         synchronized (mAwSettingsLock) {
             size = clipFontSize(size);
             if (mMinimumFontSize != size) {
@@ -762,7 +889,7 @@ public class AwSettings {
      */
     public int getMinimumFontSize() {
         synchronized (mAwSettingsLock) {
-            return mMinimumFontSize;
+            return getMinimumFontSizeLocked();
         }
     }
 
@@ -776,6 +903,7 @@ public class AwSettings {
      * See {@link android.webkit.WebSettings#setMinimumLogicalFontSize}.
      */
     public void setMinimumLogicalFontSize(int size) {
+        if (TRACE) Log.i(LOGTAG, "setMinimumLogicalFontSize=" + size);
         synchronized (mAwSettingsLock) {
             size = clipFontSize(size);
             if (mMinimumLogicalFontSize != size) {
@@ -790,7 +918,7 @@ public class AwSettings {
      */
     public int getMinimumLogicalFontSize() {
         synchronized (mAwSettingsLock) {
-            return mMinimumLogicalFontSize;
+            return getMinimumLogicalFontSizeLocked();
         }
     }
 
@@ -804,6 +932,7 @@ public class AwSettings {
      * See {@link android.webkit.WebSettings#setDefaultFontSize}.
      */
     public void setDefaultFontSize(int size) {
+        if (TRACE) Log.i(LOGTAG, "setDefaultFontSize=" + size);
         synchronized (mAwSettingsLock) {
             size = clipFontSize(size);
             if (mDefaultFontSize != size) {
@@ -818,7 +947,7 @@ public class AwSettings {
      */
     public int getDefaultFontSize() {
         synchronized (mAwSettingsLock) {
-            return mDefaultFontSize;
+            return getDefaultFontSizeLocked();
         }
     }
 
@@ -832,6 +961,7 @@ public class AwSettings {
      * See {@link android.webkit.WebSettings#setDefaultFixedFontSize}.
      */
     public void setDefaultFixedFontSize(int size) {
+        if (TRACE) Log.i(LOGTAG, "setDefaultFixedFontSize=" + size);
         synchronized (mAwSettingsLock) {
             size = clipFontSize(size);
             if (mDefaultFixedFontSize != size) {
@@ -846,7 +976,7 @@ public class AwSettings {
      */
     public int getDefaultFixedFontSize() {
         synchronized (mAwSettingsLock) {
-            return mDefaultFixedFontSize;
+            return getDefaultFixedFontSizeLocked();
         }
     }
 
@@ -860,6 +990,7 @@ public class AwSettings {
      * See {@link android.webkit.WebSettings#setJavaScriptEnabled}.
      */
     public void setJavaScriptEnabled(boolean flag) {
+        if (TRACE) Log.i(LOGTAG, "setJavaScriptEnabled=" + flag);
         synchronized (mAwSettingsLock) {
             if (mJavaScriptEnabled != flag) {
                 mJavaScriptEnabled = flag;
@@ -872,6 +1003,7 @@ public class AwSettings {
      * See {@link android.webkit.WebSettings#setAllowUniversalAccessFromFileURLs}.
      */
     public void setAllowUniversalAccessFromFileURLs(boolean flag) {
+        if (TRACE) Log.i(LOGTAG, "setAllowUniversalAccessFromFileURLs=" + flag);
         synchronized (mAwSettingsLock) {
             if (mAllowUniversalAccessFromFileURLs != flag) {
                 mAllowUniversalAccessFromFileURLs = flag;
@@ -884,6 +1016,7 @@ public class AwSettings {
      * See {@link android.webkit.WebSettings#setAllowFileAccessFromFileURLs}.
      */
     public void setAllowFileAccessFromFileURLs(boolean flag) {
+        if (TRACE) Log.i(LOGTAG, "setAllowFileAccessFromFileURLs=" + flag);
         synchronized (mAwSettingsLock) {
             if (mAllowFileAccessFromFileURLs != flag) {
                 mAllowFileAccessFromFileURLs = flag;
@@ -896,6 +1029,7 @@ public class AwSettings {
      * See {@link android.webkit.WebSettings#setLoadsImagesAutomatically}.
      */
     public void setLoadsImagesAutomatically(boolean flag) {
+        if (TRACE) Log.i(LOGTAG, "setLoadsImagesAutomatically=" + flag);
         synchronized (mAwSettingsLock) {
             if (mLoadsImagesAutomatically != flag) {
                 mLoadsImagesAutomatically = flag;
@@ -909,7 +1043,7 @@ public class AwSettings {
      */
     public boolean getLoadsImagesAutomatically() {
         synchronized (mAwSettingsLock) {
-            return mLoadsImagesAutomatically;
+            return getLoadsImagesAutomaticallyLocked();
         }
     }
 
@@ -923,6 +1057,7 @@ public class AwSettings {
      * See {@link android.webkit.WebSettings#setImagesEnabled}.
      */
     public void setImagesEnabled(boolean flag) {
+        if (TRACE) Log.i(LOGTAG, "setBlockNetworkImage=" + flag);
         synchronized (mAwSettingsLock) {
             if (mImagesEnabled != flag) {
                 mImagesEnabled = flag;
@@ -966,7 +1101,7 @@ public class AwSettings {
      */
     public boolean getAllowUniversalAccessFromFileURLs() {
         synchronized (mAwSettingsLock) {
-            return mAllowUniversalAccessFromFileURLs;
+            return getAllowUniversalAccessFromFileURLsLocked();
         }
     }
 
@@ -981,7 +1116,7 @@ public class AwSettings {
      */
     public boolean getAllowFileAccessFromFileURLs() {
         synchronized (mAwSettingsLock) {
-            return mAllowFileAccessFromFileURLs;
+            return getAllowFileAccessFromFileURLsLocked();
         }
     }
 
@@ -995,13 +1130,15 @@ public class AwSettings {
      * See {@link android.webkit.WebSettings#setPluginsEnabled}.
      */
     public void setPluginsEnabled(boolean flag) {
-        setPluginState(flag ? PluginState.ON : PluginState.OFF);
+        if (TRACE) Log.i(LOGTAG, "setPluginsEnabled=" + flag);
+        setPluginState(flag ? PLUGIN_STATE_ON : PLUGIN_STATE_OFF);
     }
 
     /**
      * See {@link android.webkit.WebSettings#setPluginState}.
      */
-    public void setPluginState(PluginState state) {
+    public void setPluginState(@PluginState int state) {
+        if (TRACE) Log.i(LOGTAG, "setPluginState=" + state);
         synchronized (mAwSettingsLock) {
             if (mPluginState != state) {
                 mPluginState = state;
@@ -1015,7 +1152,7 @@ public class AwSettings {
      */
     public boolean getPluginsEnabled() {
         synchronized (mAwSettingsLock) {
-            return mPluginState == PluginState.ON;
+            return mPluginState == PLUGIN_STATE_ON;
         }
     }
 
@@ -1026,13 +1163,14 @@ public class AwSettings {
     @CalledByNative
     private boolean getPluginsDisabledLocked() {
         assert Thread.holdsLock(mAwSettingsLock);
-        return mPluginState == PluginState.OFF;
+        return mPluginState == PLUGIN_STATE_OFF;
     }
 
     /**
      * See {@link android.webkit.WebSettings#getPluginState}.
      */
-    public PluginState getPluginState() {
+    @PluginState
+    public int getPluginState() {
         synchronized (mAwSettingsLock) {
             return mPluginState;
         }
@@ -1043,6 +1181,7 @@ public class AwSettings {
      * See {@link android.webkit.WebSettings#setJavaScriptCanOpenWindowsAutomatically}.
      */
     public void setJavaScriptCanOpenWindowsAutomatically(boolean flag) {
+        if (TRACE) Log.i(LOGTAG, "setJavaScriptCanOpenWindowsAutomatically=" + flag);
         synchronized (mAwSettingsLock) {
             if (mJavaScriptCanOpenWindowsAutomatically != flag) {
                 mJavaScriptCanOpenWindowsAutomatically = flag;
@@ -1056,7 +1195,7 @@ public class AwSettings {
      */
     public boolean getJavaScriptCanOpenWindowsAutomatically() {
         synchronized (mAwSettingsLock) {
-            return mJavaScriptCanOpenWindowsAutomatically;
+            return getJavaScriptCanOpenWindowsAutomaticallyLocked();
         }
     }
 
@@ -1069,7 +1208,8 @@ public class AwSettings {
     /**
      * See {@link android.webkit.WebSettings#setLayoutAlgorithm}.
      */
-    public void setLayoutAlgorithm(LayoutAlgorithm l) {
+    public void setLayoutAlgorithm(@LayoutAlgorithm int l) {
+        if (TRACE) Log.i(LOGTAG, "setLayoutAlgorithm=" + l);
         synchronized (mAwSettingsLock) {
             if (mLayoutAlgorithm != l) {
                 mLayoutAlgorithm = l;
@@ -1081,7 +1221,8 @@ public class AwSettings {
     /**
      * See {@link android.webkit.WebSettings#getLayoutAlgorithm}.
      */
-    public LayoutAlgorithm getLayoutAlgorithm() {
+    @LayoutAlgorithm
+    public int getLayoutAlgorithm() {
         synchronized (mAwSettingsLock) {
             return mLayoutAlgorithm;
         }
@@ -1095,13 +1236,14 @@ public class AwSettings {
     @CalledByNative
     private boolean getTextAutosizingEnabledLocked() {
         assert Thread.holdsLock(mAwSettingsLock);
-        return mLayoutAlgorithm == LayoutAlgorithm.TEXT_AUTOSIZING;
+        return mLayoutAlgorithm == LAYOUT_ALGORITHM_TEXT_AUTOSIZING;
     }
 
     /**
      * See {@link android.webkit.WebSettings#setSupportMultipleWindows}.
      */
     public void setSupportMultipleWindows(boolean support) {
+        if (TRACE) Log.i(LOGTAG, "setSupportMultipleWindows=" + support);
         synchronized (mAwSettingsLock) {
             if (mSupportMultipleWindows != support) {
                 mSupportMultipleWindows = support;
@@ -1126,15 +1268,64 @@ public class AwSettings {
     }
 
     @CalledByNative
+    private boolean getCSSHexAlphaColorEnabledLocked() {
+        assert Thread.holdsLock(mAwSettingsLock);
+        return mCSSHexAlphaColorEnabled;
+    }
+
+    public void setCSSHexAlphaColorEnabled(boolean enabled) {
+        synchronized (mAwSettingsLock) {
+            if (mCSSHexAlphaColorEnabled != enabled) {
+                mCSSHexAlphaColorEnabled = enabled;
+                mEventHandler.updateWebkitPreferencesLocked();
+            }
+        }
+    }
+
+    @CalledByNative
+    private boolean getScrollTopLeftInteropEnabledLocked() {
+        assert Thread.holdsLock(mAwSettingsLock);
+        return mScrollTopLeftInteropEnabled;
+    }
+
+    public void setScrollTopLeftInteropEnabled(boolean enabled) {
+        synchronized (mAwSettingsLock) {
+            if (mScrollTopLeftInteropEnabled != enabled) {
+                mScrollTopLeftInteropEnabled = enabled;
+                mEventHandler.updateWebkitPreferencesLocked();
+            }
+        }
+    }
+
+    @CalledByNative
     private boolean getSupportLegacyQuirksLocked() {
         assert Thread.holdsLock(mAwSettingsLock);
         return mSupportLegacyQuirks;
+    }
+
+    @CalledByNative
+    private boolean getAllowEmptyDocumentPersistenceLocked() {
+        assert Thread.holdsLock(mAwSettingsLock);
+        return mAllowEmptyDocumentPersistence;
+    }
+
+    @CalledByNative
+    private boolean getAllowGeolocationOnInsecureOrigins() {
+        assert Thread.holdsLock(mAwSettingsLock);
+        return mAllowGeolocationOnInsecureOrigins;
+    }
+
+    @CalledByNative
+    private boolean getDoNotUpdateSelectionOnMutatingSelectionRange() {
+        assert Thread.holdsLock(mAwSettingsLock);
+        return mDoNotUpdateSelectionOnMutatingSelectionRange;
     }
 
     /**
      * See {@link android.webkit.WebSettings#setUseWideViewPort}.
      */
     public void setUseWideViewPort(boolean use) {
+        if (TRACE) Log.i(LOGTAG, "setUseWideViewPort=" + use);
         synchronized (mAwSettingsLock) {
             if (mUseWideViewport != use) {
                 mUseWideViewport = use;
@@ -1150,7 +1341,7 @@ public class AwSettings {
      */
     public boolean getUseWideViewPort() {
         synchronized (mAwSettingsLock) {
-            return mUseWideViewport;
+            return getUseWideViewportLocked();
         }
     }
 
@@ -1158,6 +1349,48 @@ public class AwSettings {
     private boolean getUseWideViewportLocked() {
         assert Thread.holdsLock(mAwSettingsLock);
         return mUseWideViewport;
+    }
+
+    public void setZeroLayoutHeightDisablesViewportQuirk(boolean enabled) {
+        synchronized (mAwSettingsLock) {
+            if (mZeroLayoutHeightDisablesViewportQuirk != enabled) {
+                mZeroLayoutHeightDisablesViewportQuirk = enabled;
+                mEventHandler.updateWebkitPreferencesLocked();
+            }
+        }
+    }
+
+    public boolean getZeroLayoutHeightDisablesViewportQuirk() {
+        synchronized (mAwSettingsLock) {
+            return getZeroLayoutHeightDisablesViewportQuirkLocked();
+        }
+    }
+
+    @CalledByNative
+    private boolean getZeroLayoutHeightDisablesViewportQuirkLocked() {
+        assert Thread.holdsLock(mAwSettingsLock);
+        return mZeroLayoutHeightDisablesViewportQuirk;
+    }
+
+    public void setForceZeroLayoutHeight(boolean enabled) {
+        synchronized (mAwSettingsLock) {
+            if (mForceZeroLayoutHeight != enabled) {
+                mForceZeroLayoutHeight = enabled;
+                mEventHandler.updateWebkitPreferencesLocked();
+            }
+        }
+    }
+
+    public boolean getForceZeroLayoutHeight() {
+        synchronized (mAwSettingsLock) {
+            return getForceZeroLayoutHeightLocked();
+        }
+    }
+
+    @CalledByNative
+    private boolean getForceZeroLayoutHeightLocked() {
+        assert Thread.holdsLock(mAwSettingsLock);
+        return mForceZeroLayoutHeight;
     }
 
     @CalledByNative
@@ -1170,6 +1403,7 @@ public class AwSettings {
      * See {@link android.webkit.WebSettings#setAppCacheEnabled}.
      */
     public void setAppCacheEnabled(boolean flag) {
+        if (TRACE) Log.i(LOGTAG, "setAppCacheEnabled=" + flag);
         synchronized (mAwSettingsLock) {
             if (mAppCacheEnabled != flag) {
                 mAppCacheEnabled = flag;
@@ -1182,6 +1416,7 @@ public class AwSettings {
      * See {@link android.webkit.WebSettings#setAppCachePath}.
      */
     public void setAppCachePath(String path) {
+        if (TRACE) Log.i(LOGTAG, "setAppCachePath=" + path);
         boolean needToSync = false;
         synchronized (sGlobalContentSettingsLock) {
             // AppCachePath can only be set once.
@@ -1220,6 +1455,7 @@ public class AwSettings {
      * See {@link android.webkit.WebSettings#setDomStorageEnabled}.
      */
     public void setDomStorageEnabled(boolean flag) {
+        if (TRACE) Log.i(LOGTAG, "setDomStorageEnabled=" + flag);
         synchronized (mAwSettingsLock) {
             if (mDomStorageEnabled != flag) {
                 mDomStorageEnabled = flag;
@@ -1247,6 +1483,7 @@ public class AwSettings {
      * See {@link android.webkit.WebSettings#setDatabaseEnabled}.
      */
     public void setDatabaseEnabled(boolean flag) {
+        if (TRACE) Log.i(LOGTAG, "setDatabaseEnabled=" + flag);
         synchronized (mAwSettingsLock) {
             if (mDatabaseEnabled != flag) {
                 mDatabaseEnabled = flag;
@@ -1274,6 +1511,7 @@ public class AwSettings {
      * See {@link android.webkit.WebSettings#setDefaultTextEncodingName}.
      */
     public void setDefaultTextEncodingName(String encoding) {
+        if (TRACE) Log.i(LOGTAG, "setDefaultTextEncodingName=" + encoding);
         synchronized (mAwSettingsLock) {
             if (encoding != null && !mDefaultTextEncoding.equals(encoding)) {
                 mDefaultTextEncoding = encoding;
@@ -1287,7 +1525,7 @@ public class AwSettings {
      */
     public String getDefaultTextEncodingName() {
         synchronized (mAwSettingsLock) {
-            return mDefaultTextEncoding;
+            return getDefaultTextEncodingLocked();
         }
     }
 
@@ -1301,6 +1539,7 @@ public class AwSettings {
      * See {@link android.webkit.WebSettings#setMediaPlaybackRequiresUserGesture}.
      */
     public void setMediaPlaybackRequiresUserGesture(boolean require) {
+        if (TRACE) Log.i(LOGTAG, "setMediaPlaybackRequiresUserGesture=" + require);
         synchronized (mAwSettingsLock) {
             if (mMediaPlaybackRequiresUserGesture != require) {
                 mMediaPlaybackRequiresUserGesture = require;
@@ -1314,7 +1553,7 @@ public class AwSettings {
      */
     public boolean getMediaPlaybackRequiresUserGesture() {
         synchronized (mAwSettingsLock) {
-            return mMediaPlaybackRequiresUserGesture;
+            return getMediaPlaybackRequiresUserGestureLocked();
         }
     }
 
@@ -1329,8 +1568,8 @@ public class AwSettings {
      */
     public void setDefaultVideoPosterURL(String url) {
         synchronized (mAwSettingsLock) {
-            if (mDefaultVideoPosterURL != null && !mDefaultVideoPosterURL.equals(url) ||
-                    mDefaultVideoPosterURL == null && url != null) {
+            if ((mDefaultVideoPosterURL != null && !mDefaultVideoPosterURL.equals(url))
+                    || (mDefaultVideoPosterURL == null && url != null)) {
                 mDefaultVideoPosterURL = url;
                 mEventHandler.updateWebkitPreferencesLocked();
             }
@@ -1342,7 +1581,7 @@ public class AwSettings {
      */
     public String getDefaultVideoPosterURL() {
         synchronized (mAwSettingsLock) {
-            return mDefaultVideoPosterURL;
+            return getDefaultVideoPosterURLLocked();
         }
     }
 
@@ -1355,14 +1594,11 @@ public class AwSettings {
     private void onGestureZoomSupportChanged(
             final boolean supportsDoubleTapZoom, final boolean supportsMultiTouchZoom) {
         // Always post asynchronously here, to avoid doubling back onto the caller.
-        mEventHandler.maybePostOnUiThread(new Runnable() {
-            @Override
-            public void run() {
-                synchronized (mAwSettingsLock) {
-                    if (mZoomChangeListener != null) {
-                        mZoomChangeListener.onGestureZoomSupportChanged(
-                                supportsDoubleTapZoom, supportsMultiTouchZoom);
-                    }
+        mEventHandler.maybePostOnUiThread(() -> {
+            synchronized (mAwSettingsLock) {
+                if (mZoomChangeListener != null) {
+                    mZoomChangeListener.onGestureZoomSupportChanged(
+                            supportsDoubleTapZoom, supportsMultiTouchZoom);
                 }
             }
         });
@@ -1372,6 +1608,7 @@ public class AwSettings {
      * See {@link android.webkit.WebSettings#setSupportZoom}.
      */
     public void setSupportZoom(boolean support) {
+        if (TRACE) Log.i(LOGTAG, "setSupportZoom=" + support);
         synchronized (mAwSettingsLock) {
             if (mSupportZoom != support) {
                 mSupportZoom = support;
@@ -1394,6 +1631,7 @@ public class AwSettings {
      * See {@link android.webkit.WebSettings#setBuiltInZoomControls}.
      */
     public void setBuiltInZoomControls(boolean enabled) {
+        if (TRACE) Log.i(LOGTAG, "setBuiltInZoomControls=" + enabled);
         synchronized (mAwSettingsLock) {
             if (mBuiltInZoomControls != enabled) {
                 mBuiltInZoomControls = enabled;
@@ -1416,6 +1654,7 @@ public class AwSettings {
      * See {@link android.webkit.WebSettings#setDisplayZoomControls}.
      */
     public void setDisplayZoomControls(boolean enabled) {
+        if (TRACE) Log.i(LOGTAG, "setDisplayZoomControls=" + enabled);
         synchronized (mAwSettingsLock) {
             mDisplayZoomControls = enabled;
         }
@@ -1427,6 +1666,92 @@ public class AwSettings {
     public boolean getDisplayZoomControls() {
         synchronized (mAwSettingsLock) {
             return mDisplayZoomControls;
+        }
+    }
+
+    public void setMixedContentMode(int mode) {
+        synchronized (mAwSettingsLock) {
+            if (mMixedContentMode != mode) {
+                mMixedContentMode = mode;
+                mEventHandler.updateWebkitPreferencesLocked();
+            }
+        }
+    }
+
+    public int getMixedContentMode() {
+        synchronized (mAwSettingsLock) {
+            return mMixedContentMode;
+        }
+    }
+
+    @CalledByNative
+    private boolean getAllowRunningInsecureContentLocked() {
+        assert Thread.holdsLock(mAwSettingsLock);
+        return mMixedContentMode == WebSettings.MIXED_CONTENT_ALWAYS_ALLOW;
+    }
+
+    @CalledByNative
+    private boolean getUseStricMixedContentCheckingLocked() {
+        assert Thread.holdsLock(mAwSettingsLock);
+        return mMixedContentMode == WebSettings.MIXED_CONTENT_NEVER_ALLOW;
+    }
+
+    public boolean getOffscreenPreRaster() {
+        synchronized (mAwSettingsLock) {
+            return getOffscreenPreRasterLocked();
+        }
+    }
+
+    @CalledByNative
+    private boolean getOffscreenPreRasterLocked() {
+        assert Thread.holdsLock(mAwSettingsLock);
+        return mOffscreenPreRaster;
+    }
+
+    /**
+     * Sets whether this WebView should raster tiles when it is
+     * offscreen but attached to window. Turning this on can avoid
+     * rendering artifacts when animating an offscreen WebView on-screen.
+     * In particular, insertVisualStateCallback requires this mode to function.
+     * Offscreen WebViews in this mode uses more memory. Please follow
+     * these guidelines to limit memory usage:
+     * - Webview size should be not be larger than the device screen size.
+     * - Limit simple mode to a small number of webviews. Use it for
+     *   visible webviews and webviews about to be animated to visible.
+     */
+    public void setOffscreenPreRaster(boolean enabled) {
+        synchronized (mAwSettingsLock) {
+            if (enabled != mOffscreenPreRaster) {
+                mOffscreenPreRaster = enabled;
+                mEventHandler.runOnUiThreadBlockingAndLocked(() -> {
+                    if (mNativeAwSettings != 0) {
+                        nativeUpdateOffscreenPreRasterLocked(mNativeAwSettings);
+                    }
+                });
+            }
+        }
+    }
+
+    public int getDisabledActionModeMenuItems() {
+        synchronized (mAwSettingsLock) {
+            return mDisabledMenuItems;
+        }
+    }
+
+    public void setDisabledActionModeMenuItems(int menuItems) {
+        synchronized (mAwSettingsLock) {
+            mDisabledMenuItems = menuItems;
+        }
+    }
+
+    @VisibleForTesting
+    public void updateAcceptLanguages() {
+        synchronized (mAwSettingsLock) {
+            mEventHandler.runOnUiThreadBlockingAndLocked(() -> {
+                if (mNativeAwSettings != 0) {
+                    nativeUpdateRendererPreferencesLocked(mNativeAwSettings);
+                }
+            });
         }
     }
 
@@ -1463,15 +1788,22 @@ public class AwSettings {
     }
 
     @CalledByNative
+    private boolean getRecordFullDocument() {
+        assert Thread.holdsLock(mAwSettingsLock);
+        return AwContentsStatics.getRecordFullDocument();
+    }
+
+    @CalledByNative
     private void updateEverything() {
         synchronized (mAwSettingsLock) {
-            nativeUpdateEverythingLocked(mNativeAwSettings);
+            updateEverythingLocked();
         }
     }
 
     @CalledByNative
     private void populateWebPreferences(long webPrefsPtr) {
         synchronized (mAwSettingsLock) {
+            assert mNativeAwSettings != 0;
             nativePopulateWebPreferencesLocked(mNativeAwSettings, webPrefsPtr);
         }
     }
@@ -1479,10 +1811,12 @@ public class AwSettings {
     private void updateWebkitPreferencesOnUiThreadLocked() {
         assert mEventHandler.mHandler != null;
         ThreadUtils.assertOnUiThread();
-        nativeUpdateWebkitPreferencesLocked(mNativeAwSettings);
+        if (mNativeAwSettings != 0) {
+            nativeUpdateWebkitPreferencesLocked(mNativeAwSettings);
+        }
     }
 
-    private native long nativeInit(long webContentsPtr);
+    private native long nativeInit(WebContents webContents);
 
     private native void nativeDestroy(long nativeAwSettings);
 
@@ -1501,4 +1835,8 @@ public class AwSettings {
     private static native String nativeGetDefaultUserAgent();
 
     private native void nativeUpdateFormDataPreferencesLocked(long nativeAwSettings);
+
+    private native void nativeUpdateRendererPreferencesLocked(long nativeAwSettings);
+
+    private native void nativeUpdateOffscreenPreRasterLocked(long nativeAwSettings);
 }

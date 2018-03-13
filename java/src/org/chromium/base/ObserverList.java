@@ -21,7 +21,7 @@ import javax.annotation.concurrent.NotThreadSafe;
  * The implementation (and the interface) is heavily influenced by the C++ ObserverList.
  * Notable differences:
  *   - The iterator implements NOTIFY_EXISTING_ONLY.
- *   - The FOR_EACH_OBSERVER closure is left to the clients to implement in terms of iterator().
+ *   - The range-based for loop is left to the clients to implement in terms of iterator().
  * <p/>
  * This class is not threadsafe. Observers MUST be added, removed and will be notified on the same
  * thread this is created.
@@ -44,7 +44,9 @@ public class ObserverList<E> implements Iterable<E> {
     }
 
     public final List<E> mObservers = new ArrayList<E>();
-    private int mIterationDepth = 0;
+    private int mIterationDepth;
+    private int mCount;
+    private boolean mNeedsCompact;
 
     public ObserverList() {}
 
@@ -53,34 +55,50 @@ public class ObserverList<E> implements Iterable<E> {
      * <p/>
      * An observer should not be added to the same list more than once. If an iteration is already
      * in progress, this observer will be not be visible during that iteration.
+     *
+     * @return true if the observer list changed as a result of the call.
      */
-    public void addObserver(E obs) {
+    public boolean addObserver(E obs) {
         // Avoid adding null elements to the list as they may be removed on a compaction.
         if (obs == null || mObservers.contains(obs)) {
-            assert false;
-            return;
+            return false;
         }
 
         // Structurally modifying the underlying list here. This means we
         // cannot use the underlying list's iterator to iterate over the list.
-        mObservers.add(obs);
+        boolean result = mObservers.add(obs);
+        assert result;
+
+        ++mCount;
+        return true;
     }
 
     /**
      * Remove an observer from the list if it is in the list.
+     *
+     * @return true if an element was removed as a result of this call.
      */
-    public void removeObserver(E obs) {
-        int index = mObservers.indexOf(obs);
+    public boolean removeObserver(E obs) {
+        if (obs == null) {
+            return false;
+        }
 
-        if (index == -1)
-            return;
+        int index = mObservers.indexOf(obs);
+        if (index == -1) {
+            return false;
+        }
 
         if (mIterationDepth == 0) {
             // No one is iterating over the list.
-            mObservers.remove(obs);
+            mObservers.remove(index);
         } else {
+            mNeedsCompact = true;
             mObservers.set(index, null);
         }
+        --mCount;
+        assert mCount >= 0;
+
+        return true;
     }
 
     public boolean hasObserver(E obs) {
@@ -88,12 +106,15 @@ public class ObserverList<E> implements Iterable<E> {
     }
 
     public void clear() {
+        mCount = 0;
+
         if (mIterationDepth == 0) {
             mObservers.clear();
             return;
         }
 
         int size = mObservers.size();
+        mNeedsCompact |= size != 0;
         for (int i = 0; i < size; i++) {
             mObservers.set(i, null);
         }
@@ -111,6 +132,21 @@ public class ObserverList<E> implements Iterable<E> {
      */
     public RewindableIterator<E> rewindableIterator() {
         return new ObserverListIterator();
+    }
+
+    /**
+     * Returns the number of observers currently registered in the ObserverList.
+     * This is equivalent to the number of non-empty spaces in |mObservers|.
+     */
+    public int size() {
+        return mCount;
+    }
+
+    /**
+     * Returns true if the ObserverList contains no observers.
+     */
+    public boolean isEmpty() {
+        return mCount == 0;
     }
 
     /**
@@ -134,11 +170,17 @@ public class ObserverList<E> implements Iterable<E> {
     private void decrementIterationDepthAndCompactIfNeeded() {
         mIterationDepth--;
         assert mIterationDepth >= 0;
-        if (mIterationDepth == 0)
-            compact();
+        if (mIterationDepth > 0) return;
+        if (!mNeedsCompact) return;
+        mNeedsCompact = false;
+        compact();
     }
 
-    private int getSize() {
+    /**
+     * Returns the size of the underlying storage of the ObserverList.
+     * It will take into account the empty spaces inside |mObservers|.
+     */
+    private int capacity() {
         return mObservers.size();
     }
 
@@ -148,19 +190,19 @@ public class ObserverList<E> implements Iterable<E> {
 
     private class ObserverListIterator implements RewindableIterator<E> {
         private int mListEndMarker;
-        private int mIndex = 0;
-        private boolean mIsExhausted = false;
+        private int mIndex;
+        private boolean mIsExhausted;
 
         private ObserverListIterator() {
             ObserverList.this.incrementIterationDepth();
-            mListEndMarker = ObserverList.this.getSize();
+            mListEndMarker = ObserverList.this.capacity();
         }
 
         @Override
         public void rewind() {
             compactListIfNeeded();
             ObserverList.this.incrementIterationDepth();
-            mListEndMarker = ObserverList.this.getSize();
+            mListEndMarker = ObserverList.this.capacity();
             mIsExhausted = false;
             mIndex = 0;
         }
@@ -168,8 +210,8 @@ public class ObserverList<E> implements Iterable<E> {
         @Override
         public boolean hasNext() {
             int lookupIndex = mIndex;
-            while (lookupIndex < mListEndMarker &&
-                    ObserverList.this.getObserverAt(lookupIndex) == null) {
+            while (lookupIndex < mListEndMarker
+                    && ObserverList.this.getObserverAt(lookupIndex) == null) {
                 lookupIndex++;
             }
             if (lookupIndex < mListEndMarker) return true;

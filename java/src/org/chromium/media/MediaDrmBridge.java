@@ -4,46 +4,42 @@
 
 package org.chromium.media;
 
+import android.annotation.SuppressLint;
+import android.annotation.TargetApi;
 import android.media.MediaCrypto;
 import android.media.MediaDrm;
-import android.os.AsyncTask;
 import android.os.Build;
-import android.os.Handler;
-import android.util.Log;
 
-import org.apache.http.HttpResponse;
-import org.apache.http.client.ClientProtocolException;
-import org.apache.http.client.HttpClient;
-import org.apache.http.client.methods.HttpPost;
-import org.apache.http.impl.client.DefaultHttpClient;
-import org.apache.http.util.EntityUtils;
-import org.chromium.base.CalledByNative;
-import org.chromium.base.JNINamespace;
+import org.chromium.base.ApiCompatibilityUtils;
+import org.chromium.base.Callback;
+import org.chromium.base.Log;
+import org.chromium.base.annotations.CalledByNative;
+import org.chromium.base.annotations.JNINamespace;
+import org.chromium.base.annotations.MainDex;
+import org.chromium.media.MediaDrmSessionManager.SessionId;
+import org.chromium.media.MediaDrmSessionManager.SessionInfo;
 
-import java.io.IOException;
-import java.nio.ByteBuffer;
 import java.util.ArrayDeque;
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.List;
 import java.util.UUID;
 
 /**
  * A wrapper of the android MediaDrm class. Each MediaDrmBridge manages multiple
- * sessions for a single MediaSourcePlayer.
+ * sessions for AndroidVideoDecodeAccelerators and MediaCodecAudioDecoders.
  */
 @JNINamespace("media")
-class MediaDrmBridge {
+@MainDex
+@SuppressLint("WrongConstant")
+@TargetApi(Build.VERSION_CODES.KITKAT)
+public class MediaDrmBridge {
     // Implementation Notes:
     // - A media crypto session (mMediaCryptoSession) is opened after MediaDrm
-    //   is created. This session will be added to mSessionIds.
-    //   a) In multiple session mode, this session will only be used to create
-    //      the MediaCrypto object. It's associated mime type is always null and
-    //      it's session ID is always INVALID_SESSION_ID.
-    //   b) In single session mode, this session will be used to create the
-    //      MediaCrypto object and will be used to call getKeyRequest() and
-    //      manage all keys.  The session ID will always be the lastest session
-    //      ID passed by the caller.
-    // - Each createSession() call creates a new session. All sessions are
-    //   managed in mSessionIds.
+    //   is created. This session will NOT be added to mSessionManager and will only
+    //   be used to create the MediaCrypto object.
+    // - Each createSession() call creates a new session. All created sessions
+    //   are managed in mSessionManager.
     // - Whenever NotProvisionedException is thrown, we will clean up the
     //   current state and start the provisioning process.
     // - When provisioning is finished, we will try to resume suspended
@@ -52,44 +48,48 @@ class MediaDrmBridge {
     //   b) Finish createSession() if previous createSession() was interrupted
     //      by a NotProvisionedException.
     // - Whenever an unexpected error occurred, we'll call release() to release
-    //   all resources and clear all states. In that case all calls to this
-    //   object will be no-op. All public APIs and callbacks should check
-    //   mMediaBridge to make sure release() hasn't been called. Also, we call
-    //   release() immediately after the error happens (e.g. after mMediaDrm)
-    //   calls. Indirect calls should not call release() again to avoid
-    //   duplication (even though it doesn't hurt to call release() twice).
+    //   all resources immediately, clear all states and fail all pending
+    //   operations. After that all calls to this object will fail (e.g. return
+    //   null or reject the promise). All public APIs and callbacks should check
+    //   mMediaBridge to make sure release() hasn't been called.
 
-    private static final String TAG = "MediaDrmBridge";
+    private static final String TAG = "cr_media";
     private static final String SECURITY_LEVEL = "securityLevel";
+    private static final String SERVER_CERTIFICATE = "serviceCertificate";
+    private static final String ORIGIN = "origin";
     private static final String PRIVACY_MODE = "privacyMode";
     private static final String SESSION_SHARING = "sessionSharing";
     private static final String ENABLE = "enable";
-    private static final int INVALID_SESSION_ID = 0;
+    private static final long INVALID_NATIVE_MEDIA_DRM_BRIDGE = 0;
+
+    // Scheme UUID for Widevine. See http://dashif.org/identifiers/protection/
+    private static final UUID WIDEVINE_UUID =
+            UUID.fromString("edef8ba9-79d6-4ace-a3c8-27dcd51d21ed");
+
+    // On Android L and before, MediaDrm doesn't support KeyStatus. Use a dummy
+    // key ID to report key status info.
+    // See details: https://github.com/w3c/encrypted-media/issues/32
+    private static final byte[] DUMMY_KEY_ID = new byte[] {0};
+
+    // Special provision response to remove the cert.
+    private static final byte[] UNPROVISION = ApiCompatibilityUtils.getBytesUtf8("unprovision");
 
     private MediaDrm mMediaDrm;
+    private MediaCrypto mMediaCrypto;
     private long mNativeMediaDrmBridge;
     private UUID mSchemeUUID;
-    private Handler mHandler;
 
-    // In this mode, we only open one session, i.e. mMediaCryptoSession.
-    private boolean mSingleSessionMode;
+    // A session only for the purpose of creating a MediaCrypto object. Created
+    // after construction, or after the provisioning process is successfully
+    // completed. No getKeyRequest() should be called on |mMediaCryptoSession|.
+    private SessionId mMediaCryptoSession;
 
-    // A session only for the purpose of creating a MediaCrypto object.
-    // This session is opened when createSession() is called for the first
-    // time.
-    // - In multiple session mode, all following createSession() calls
-    // should create a new session and use it to call getKeyRequest(). No
-    // getKeyRequest() should ever be called on this media crypto session.
-    // - In single session mode, all createSession() calls use the same
-    // media crypto session. When createSession() is called with a new
-    // initData, previously added keys may not be available anymore.
-    private ByteBuffer mMediaCryptoSession;
-    private MediaCrypto mMediaCrypto;
+    // The map of all opened sessions (excluding mMediaCryptoSession) to their
+    // associated meta data, e.g. mime types, key types.
+    private MediaDrmSessionManager mSessionManager;
 
-    // The map of all opened sessions to their session reference IDs.
-    private HashMap<ByteBuffer, Integer> mSessionIds;
-    // The map of all opened sessions to their mime types.
-    private HashMap<ByteBuffer, String> mSessionMimeTypes;
+    // The persistent storage to record origin provisioning informations.
+    private MediaDrmStorageBridge mStorage;
 
     // The queue of all pending createSession() data.
     private ArrayDeque<PendingCreateSessionData> mPendingCreateSessionDataQueue;
@@ -97,29 +97,125 @@ class MediaDrmBridge {
     private boolean mResetDeviceCredentialsPending;
 
     // MediaDrmBridge is waiting for provisioning response from the server.
-    //
-    // Notes about NotProvisionedException: This exception can be thrown in a
-    // lot of cases. To streamline implementation, we do not catch it in private
-    // non-native methods and only catch it in public APIs.
     private boolean mProvisioningPending;
+
+    // Boolean to track if 'ORIGIN' is set in MediaDrm.
+    private boolean mOriginSet = false;
+
+    // Delay the MediaDrm event handle if present.
+    private SessionEventDeferrer mSessionEventDeferrer = null;
+
+    // Block MediaDrm event for |mSessionId|. MediaDrm may fire event before the
+    // functions return. This may break Chromium CDM API's assumption. For
+    // example, when loading session, 'restoreKeys' will trigger key status
+    // change event. But the session isn't known to Chromium CDM because the
+    // promise isn't resolved. The class can block and collect these events and
+    // fire these events later.
+    private static class SessionEventDeferrer {
+        private final SessionId mSessionId;
+        private final ArrayList<Runnable> mEventHandlers;
+
+        SessionEventDeferrer(SessionId sessionId) {
+            mSessionId = sessionId;
+            mEventHandlers = new ArrayList<>();
+        }
+
+        boolean shouldDefer(SessionId sessionId) {
+            return mSessionId.isEqual(sessionId);
+        }
+
+        void defer(Runnable handler) {
+            mEventHandlers.add(handler);
+        }
+
+        void fire() {
+            for (Runnable r : mEventHandlers) {
+                r.run();
+            }
+
+            mEventHandlers.clear();
+        }
+    }
+
+    /**
+     *  An equivalent of MediaDrm.KeyStatus, which is only available on M+.
+     */
+    @MainDex
+    private static class KeyStatus {
+        private final byte[] mKeyId;
+        private final int mStatusCode;
+
+        private KeyStatus(byte[] keyId, int statusCode) {
+            mKeyId = keyId;
+            mStatusCode = statusCode;
+        }
+
+        @CalledByNative("KeyStatus")
+        private byte[] getKeyId() {
+            return mKeyId;
+        }
+
+        @CalledByNative("KeyStatus")
+        private int getStatusCode() {
+            return mStatusCode;
+        }
+    }
+
+    /**
+     *  Creates a dummy single element list of KeyStatus with a dummy key ID and
+     *  the specified keyStatus.
+     */
+    private static List<KeyStatus> getDummyKeysInfo(int statusCode) {
+        List<KeyStatus> keysInfo = new ArrayList<KeyStatus>();
+        keysInfo.add(new KeyStatus(DUMMY_KEY_ID, statusCode));
+        return keysInfo;
+    }
 
     /**
      *  This class contains data needed to call createSession().
      */
+    @MainDex
     private static class PendingCreateSessionData {
-        private final int mSessionId;
         private final byte[] mInitData;
         private final String mMimeType;
 
-        private PendingCreateSessionData(int sessionId, byte[] initData, String mimeType) {
-            mSessionId = sessionId;
+        // Key type to get the key request. Only KEY_TYPE_STREAMING and
+        // KEY_TYPE_OFFLINE are supported.
+        private final int mKeyType;
+        private final HashMap<String, String> mOptionalParameters;
+        private final long mPromiseId;
+
+        private PendingCreateSessionData(byte[] initData, String mimeType, int keyType,
+                HashMap<String, String> optionalParameters, long promiseId) {
             mInitData = initData;
             mMimeType = mimeType;
+
+            assert keyType == MediaDrm.KEY_TYPE_STREAMING || keyType == MediaDrm.KEY_TYPE_OFFLINE;
+            mKeyType = keyType;
+
+            mOptionalParameters = optionalParameters;
+            mPromiseId = promiseId;
         }
 
-        private int sessionId() { return mSessionId; }
-        private byte[] initData() { return mInitData; }
-        private String mimeType() { return mMimeType; }
+        private byte[] initData() {
+            return mInitData;
+        }
+
+        private String mimeType() {
+            return mMimeType;
+        }
+
+        private int keyType() {
+            return mKeyType;
+        }
+
+        private HashMap<String, String> optionalParameters() {
+            return mOptionalParameters;
+        }
+
+        private long promiseId() {
+            return mPromiseId;
+        }
     }
 
     private static UUID getUUIDFromBytes(byte[] data) {
@@ -137,78 +233,84 @@ class MediaDrmBridge {
         return new UUID(mostSigBits, leastSigBits);
     }
 
-    /**
-     *  Gets session associated with the sessionId.
-     *
-     *  @return session if sessionId maps a valid opened session. Returns null
-     *  otherwise.
-     */
-    private ByteBuffer getSession(int sessionId) {
-        for (ByteBuffer session : mSessionIds.keySet()) {
-            if (mSessionIds.get(session) == sessionId) {
-                return session;
-            }
-        }
-        return null;
+    private boolean isNativeMediaDrmBridgeValid() {
+        return mNativeMediaDrmBridge != INVALID_NATIVE_MEDIA_DRM_BRIDGE;
     }
 
-    private MediaDrmBridge(UUID schemeUUID, long nativeMediaDrmBridge, boolean singleSessionMode)
-            throws android.media.UnsupportedSchemeException {
+    private boolean isWidevine() {
+        return mSchemeUUID.equals(WIDEVINE_UUID);
+    }
+
+    @TargetApi(Build.VERSION_CODES.M)
+    private MediaDrmBridge(UUID schemeUUID, long nativeMediaDrmBridge,
+            long nativeMediaDrmStorageBridge) throws android.media.UnsupportedSchemeException {
         mSchemeUUID = schemeUUID;
         mMediaDrm = new MediaDrm(schemeUUID);
+
         mNativeMediaDrmBridge = nativeMediaDrmBridge;
-        mHandler = new Handler();
-        mSingleSessionMode = singleSessionMode;
-        mSessionIds = new HashMap<ByteBuffer, Integer>();
-        mSessionMimeTypes = new HashMap<ByteBuffer, String>();
+        assert isNativeMediaDrmBridgeValid();
+
+        mStorage = new MediaDrmStorageBridge(nativeMediaDrmStorageBridge);
+        mSessionManager = new MediaDrmSessionManager(mStorage);
+
         mPendingCreateSessionDataQueue = new ArrayDeque<PendingCreateSessionData>();
         mResetDeviceCredentialsPending = false;
         mProvisioningPending = false;
 
-        mMediaDrm.setOnEventListener(new MediaDrmListener());
-        mMediaDrm.setPropertyString(PRIVACY_MODE, ENABLE);
-        if (!mSingleSessionMode) {
-            mMediaDrm.setPropertyString(SESSION_SHARING, ENABLE);
+        mMediaDrm.setOnEventListener(new EventListener());
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            mMediaDrm.setOnExpirationUpdateListener(new ExpirationUpdateListener(), null);
+            mMediaDrm.setOnKeyStatusChangeListener(new KeyStatusChangeListener(), null);
         }
 
-        // We could open a MediaCrypto session here to support faster start of
-        // clear lead (no need to wait for createSession()). But on
-        // Android, memory and battery resources are precious and we should
-        // only create a session when we are sure we'll use it.
-        // TODO(xhwang): Investigate other options to support fast start.
+        if (isWidevine()) {
+            mMediaDrm.setPropertyString(PRIVACY_MODE, ENABLE);
+            mMediaDrm.setPropertyString(SESSION_SHARING, ENABLE);
+        }
     }
 
     /**
      * Create a MediaCrypto object.
      *
-     * @return whether a MediaCrypto object is successfully created.
+     * @return false upon fatal error in creating MediaCrypto. Returns true
+     * otherwise, including the following two cases:
+     *   1. MediaCrypto is successfully created and notified.
+     *   2. Device is not provisioned and MediaCrypto creation will be tried
+     *      again after the provisioning process is completed.
+     *
+     *  When false is returned, the caller should call release(), which will
+     *  notify the native code with a null MediaCrypto, if needed.
      */
-    private boolean createMediaCrypto() throws android.media.NotProvisionedException {
-        if (mMediaDrm == null) {
-            return false;
-        }
+    private boolean createMediaCrypto() {
+        assert mMediaDrm != null;
         assert !mProvisioningPending;
         assert mMediaCryptoSession == null;
-        assert mMediaCrypto == null;
 
         // Open media crypto session.
-        mMediaCryptoSession = openSession();
-        if (mMediaCryptoSession == null) {
+        byte[] mediaCryptoSessionDrmId = null;
+        try {
+            mediaCryptoSessionDrmId = openSession();
+        } catch (android.media.NotProvisionedException e) {
+            Log.d(TAG, "Device not provisioned", e);
+            startProvisioning();
+            return true;
+        }
+
+        if (mediaCryptoSessionDrmId == null) {
             Log.e(TAG, "Cannot create MediaCrypto Session.");
             return false;
         }
-        Log.d(TAG, "MediaCrypto Session created: " + mMediaCryptoSession);
+
+        mMediaCryptoSession = SessionId.createTemporarySessionId(mediaCryptoSessionDrmId);
+
+        Log.d(TAG, "MediaCrypto Session created: %s", mMediaCryptoSession.toHexString());
 
         // Create MediaCrypto object.
         try {
             if (MediaCrypto.isCryptoSchemeSupported(mSchemeUUID)) {
-                final byte[] mediaCryptoSession = mMediaCryptoSession.array();
-                mMediaCrypto = new MediaCrypto(mSchemeUUID, mediaCryptoSession);
-                assert mMediaCrypto != null;
+                mMediaCrypto = new MediaCrypto(mSchemeUUID, mMediaCryptoSession.drmId());
                 Log.d(TAG, "MediaCrypto successfully created!");
-                mSessionIds.put(mMediaCryptoSession, INVALID_SESSION_ID);
-                // Notify the native code that MediaCrypto is ready.
-                nativeOnMediaCryptoReady(mNativeMediaDrmBridge);
+                onMediaCryptoReady(mMediaCrypto);
                 return true;
             } else {
                 Log.e(TAG, "Cannot create MediaCrypto for unsupported scheme.");
@@ -217,23 +319,33 @@ class MediaDrmBridge {
             Log.e(TAG, "Cannot create MediaCrypto", e);
         }
 
-        release();
+        closeSessionNoException(mMediaCryptoSession);
+        mMediaCryptoSession = null;
+
         return false;
     }
 
     /**
-     * Open a new session..
+     * Open a new session.
      *
-     * @return the session opened. Returns null if unexpected error happened.
+     * @return ID of the session opened. Returns null if unexpected error happened.
      */
-    private ByteBuffer openSession() throws android.media.NotProvisionedException {
+    private byte[] openSession() throws android.media.NotProvisionedException {
         assert mMediaDrm != null;
         try {
-            byte[] session = mMediaDrm.openSession();
-            // ByteBuffer.wrap() is backed by the byte[]. Make a clone here in
-            // case the underlying byte[] is modified.
-            return ByteBuffer.wrap(session.clone());
+            byte[] sessionId = mMediaDrm.openSession();
+            // Make a clone here in case the underlying byte[] is modified.
+            return sessionId.clone();
         } catch (java.lang.RuntimeException e) {  // TODO(xhwang): Drop this?
+            Log.e(TAG, "Cannot open a new session", e);
+            release();
+            return null;
+        } catch (android.media.NotProvisionedException e) {
+            // Throw NotProvisionedException so that we can startProvisioning().
+            throw e;
+        } catch (android.media.MediaDrmException e) {
+            // Other MediaDrmExceptions (e.g. ResourceBusyException) are not
+            // recoverable.
             Log.e(TAG, "Cannot open a new session", e);
             release();
             return null;
@@ -241,20 +353,9 @@ class MediaDrmBridge {
     }
 
     /**
-     * Close a session.
-     *
-     * @param session to be closed.
-     */
-    private void closeSession(ByteBuffer session) {
-        assert mMediaDrm != null;
-        mMediaDrm.closeSession(session.array());
-    }
-
-    /**
      * Check whether the crypto scheme is supported for the given container.
      * If |containerMimeType| is an empty string, we just return whether
      * the crypto scheme is supported.
-     * TODO(qinmin): Implement the checking for container.
      *
      * @return true if the container and the crypto scheme is supported, or
      * false otherwise.
@@ -262,59 +363,110 @@ class MediaDrmBridge {
     @CalledByNative
     private static boolean isCryptoSchemeSupported(byte[] schemeUUID, String containerMimeType) {
         UUID cryptoScheme = getUUIDFromBytes(schemeUUID);
-        return MediaDrm.isCryptoSchemeSupported(cryptoScheme);
+
+        if (containerMimeType.isEmpty()) {
+            return MediaDrm.isCryptoSchemeSupported(cryptoScheme);
+        }
+
+        return MediaDrm.isCryptoSchemeSupported(cryptoScheme, containerMimeType);
     }
 
     /**
      * Create a new MediaDrmBridge from the crypto scheme UUID.
      *
      * @param schemeUUID Crypto scheme UUID.
-     * @param securityLevel Security level to be used.
+     * @param securityOrigin Security origin. Empty value means no need for origin isolated storage.
+     * @param securityLevel Security level. If empty, the default one should be used.
      * @param nativeMediaDrmBridge Native object of this class.
+     * @param nativeMediaDrmStorageBridge Native object of persistent storage.
      */
     @CalledByNative
-    private static MediaDrmBridge create(byte[] schemeUUID, int nativeMediaDrmBridge) {
+    private static MediaDrmBridge create(byte[] schemeUUID, String securityOrigin,
+            String securityLevel, long nativeMediaDrmBridge, long nativeMediaDrmStorageBridge) {
         UUID cryptoScheme = getUUIDFromBytes(schemeUUID);
         if (cryptoScheme == null || !MediaDrm.isCryptoSchemeSupported(cryptoScheme)) {
             return null;
         }
 
-        boolean singleSessionMode = false;
-        if (Build.VERSION.RELEASE.equals("4.4")) {
-            singleSessionMode = true;
-        }
-        Log.d(TAG, "MediaDrmBridge uses " +
-                (singleSessionMode ? "single" : "multiple") + "-session mode.");
-
         MediaDrmBridge mediaDrmBridge = null;
         try {
             mediaDrmBridge = new MediaDrmBridge(
-                cryptoScheme, nativeMediaDrmBridge, singleSessionMode);
+                    cryptoScheme, nativeMediaDrmBridge, nativeMediaDrmStorageBridge);
             Log.d(TAG, "MediaDrmBridge successfully created.");
         } catch (android.media.UnsupportedSchemeException e) {
             Log.e(TAG, "Unsupported DRM scheme", e);
+            return null;
         } catch (java.lang.IllegalArgumentException e) {
             Log.e(TAG, "Failed to create MediaDrmBridge", e);
+            return null;
         } catch (java.lang.IllegalStateException e) {
             Log.e(TAG, "Failed to create MediaDrmBridge", e);
+            return null;
+        }
+
+        if (!securityLevel.isEmpty() && !mediaDrmBridge.setSecurityLevel(securityLevel)) {
+            return null;
+        }
+
+        if (!securityOrigin.isEmpty() && !mediaDrmBridge.setOrigin(securityOrigin)) {
+            return null;
+        }
+
+        if (!mediaDrmBridge.createMediaCrypto()) {
+            return null;
         }
 
         return mediaDrmBridge;
     }
 
     /**
+     * Set the security origin for the MediaDrm. All information should be isolated for different
+     * origins, e.g. certificates, licenses.
+     */
+    private boolean setOrigin(String origin) {
+        assert Build.VERSION.SDK_INT >= Build.VERSION_CODES.M;
+
+        if (!isWidevine()) {
+            Log.d(TAG, "Property " + ORIGIN + " isn't supported");
+            return true;
+        }
+
+        assert mMediaDrm != null;
+        assert !origin.isEmpty();
+
+        try {
+            mMediaDrm.setPropertyString(ORIGIN, origin);
+            mOriginSet = true;
+            return true;
+        } catch (java.lang.IllegalArgumentException e) {
+            Log.e(TAG, "Failed to set security origin %s", origin, e);
+        } catch (java.lang.IllegalStateException e) {
+            Log.e(TAG, "Failed to set security origin %s", origin, e);
+        }
+
+        Log.e(TAG, "Security origin %s not supported!", origin);
+        return false;
+    }
+
+    /**
      * Set the security level that the MediaDrm object uses.
      * This function should be called right after we construct MediaDrmBridge
      * and before we make any other calls.
+     *
+     * @param securityLevel Security level to be set.
+     * @return whether the security level was successfully set.
      */
-    @CalledByNative
     private boolean setSecurityLevel(String securityLevel) {
-        if (mMediaDrm == null || mMediaCrypto != null) {
-            return false;
+        if (!isWidevine()) {
+            Log.d(TAG, "Security level is not supported.");
+            return true;
         }
 
+        assert mMediaDrm != null;
+        assert !securityLevel.isEmpty();
+
         String currentSecurityLevel = mMediaDrm.getPropertyString(SECURITY_LEVEL);
-        Log.e(TAG, "Security level: current " + currentSecurityLevel + ", new " + securityLevel);
+        Log.e(TAG, "Security level: current %s, new %s", currentSecurityLevel, securityLevel);
         if (securityLevel.equals(currentSecurityLevel)) {
             // No need to set the same security level again. This is not just
             // a shortcut! Setting the same security level actually causes an
@@ -326,21 +478,38 @@ class MediaDrmBridge {
             mMediaDrm.setPropertyString(SECURITY_LEVEL, securityLevel);
             return true;
         } catch (java.lang.IllegalArgumentException e) {
-            Log.e(TAG, "Failed to set security level " + securityLevel, e);
+            Log.e(TAG, "Failed to set security level %s", securityLevel, e);
         } catch (java.lang.IllegalStateException e) {
-            Log.e(TAG, "Failed to set security level " + securityLevel, e);
+            Log.e(TAG, "Failed to set security level %s", securityLevel, e);
         }
 
-        Log.e(TAG, "Security level " + securityLevel + " not supported!");
+        Log.e(TAG, "Security level %s not supported!", securityLevel);
         return false;
     }
 
     /**
-     * Return the MediaCrypto object if available.
+     * Set the server certificate.
+     *
+     * @param certificate Server certificate to be set.
+     * @return whether the server certificate was successfully set.
      */
     @CalledByNative
-    private MediaCrypto getMediaCrypto() {
-        return mMediaCrypto;
+    private boolean setServerCertificate(byte[] certificate) {
+        if (!isWidevine()) {
+            Log.d(TAG, "Setting server certificate is not supported.");
+            return true;
+        }
+
+        try {
+            mMediaDrm.setPropertyByteArray(SERVER_CERTIFICATE, certificate);
+            return true;
+        } catch (java.lang.IllegalArgumentException e) {
+            Log.e(TAG, "Failed to set server certificate", e);
+        } catch (java.lang.IllegalStateException e) {
+            Log.e(TAG, "Failed to set server certificate", e);
+        }
+
+        return false;
     }
 
     /**
@@ -348,76 +517,158 @@ class MediaDrmBridge {
      */
     @CalledByNative
     private void resetDeviceCredentials() {
+        if (mMediaDrm == null) {
+            onResetDeviceCredentialsCompleted(false);
+            return;
+        }
+
         mResetDeviceCredentialsPending = true;
-        MediaDrm.ProvisionRequest request = mMediaDrm.getProvisionRequest();
-        PostRequestTask postTask = new PostRequestTask(request.getData());
-        postTask.execute(request.getDefaultUrl());
+        startProvisioning();
     }
 
     /**
-     * Release the MediaDrmBridge object.
+     * Unprovision the current origin, a.k.a removing the cert for current origin.
      */
     @CalledByNative
-    private void release() {
-        // Do not reset mHandler and mNativeMediaDrmBridge so that we can still
-        // post KeyError back to native code.
+    private void unprovision() {
+        if (mMediaDrm == null) {
+            return;
+        }
 
+        // Unprovision only works for origin isolated storage.
+        if (!mOriginSet) {
+            return;
+        }
+
+        provideProvisionResponse(UNPROVISION);
+    }
+
+    /**
+     * Destroy the MediaDrmBridge object.
+     */
+    @CalledByNative
+    private void destroy() {
+        mNativeMediaDrmBridge = INVALID_NATIVE_MEDIA_DRM_BRIDGE;
+        if (mMediaDrm != null) {
+            release();
+        }
+    }
+
+    /**
+     * Release all allocated resources and finish all pending operations.
+     */
+    private void release() {
+        // Note that mNativeMediaDrmBridge may have already been reset (see destroy()).
+
+        assert mMediaDrm != null;
+
+        // Reject all pending session creation.
+        for (PendingCreateSessionData data : mPendingCreateSessionDataQueue) {
+            onPromiseRejected(data.promiseId(), "Create session aborted.");
+        }
         mPendingCreateSessionDataQueue.clear();
         mPendingCreateSessionDataQueue = null;
 
-        for (ByteBuffer session : mSessionIds.keySet()) {
-            closeSession(session);
+        // Close all open sessions.
+        for (SessionId sessionId : mSessionManager.getAllSessionIds()) {
+            try {
+                // Some implementations don't have removeKeys, crbug/475632
+                mMediaDrm.removeKeys(sessionId.drmId());
+            } catch (Exception e) {
+                Log.e(TAG, "removeKeys failed: ", e);
+            }
+
+            closeSessionNoException(sessionId);
+            onSessionClosed(sessionId);
         }
-        mSessionIds.clear();
-        mSessionIds = null;
-        mSessionMimeTypes.clear();
-        mSessionMimeTypes = null;
+        mSessionManager = new MediaDrmSessionManager(mStorage);
 
-        // This session was closed in the "for" loop above.
-        mMediaCryptoSession = null;
+        // Close mMediaCryptoSession if it's open or notify MediaCrypto
+        // creation failure if it's never successfully opened.
+        if (mMediaCryptoSession == null) {
+            // MediaCrypto never notified. Notify a null one now.
+            onMediaCryptoReady(null);
+        } else {
+            closeSessionNoException(mMediaCryptoSession);
+            mMediaCryptoSession = null;
+        }
 
-        if (mMediaCrypto != null) {
-            mMediaCrypto.release();
-            mMediaCrypto = null;
+        // Fail device credentials resetting.
+        if (mResetDeviceCredentialsPending) {
+            mResetDeviceCredentialsPending = false;
+            onResetDeviceCredentialsCompleted(false);
         }
 
         if (mMediaDrm != null) {
             mMediaDrm.release();
             mMediaDrm = null;
         }
+
+        if (mMediaCrypto != null) {
+            mMediaCrypto.release();
+            mMediaCrypto = null;
+        }
     }
 
     /**
      * Get a key request.
      *
-     * @param session Session on which we need to get the key request.
+     * @param sessionId ID of session on which we need to get the key request.
      * @param data Data needed to get the key request.
      * @param mime Mime type to get the key request.
+     * @param keyType Key type for the requested key.
+     * @param optionalParameters Optional parameters to pass to the DRM plugin.
      *
      * @return the key request.
      */
-    private MediaDrm.KeyRequest getKeyRequest(ByteBuffer session, byte[] data, String mime)
+    private MediaDrm.KeyRequest getKeyRequest(SessionId sessionId, byte[] data, String mime,
+            int keyType, HashMap<String, String> optionalParameters)
             throws android.media.NotProvisionedException {
         assert mMediaDrm != null;
-        assert mMediaCrypto != null;
+        assert mMediaCryptoSession != null;
         assert !mProvisioningPending;
 
-        HashMap<String, String> optionalParameters = new HashMap<String, String>();
-        MediaDrm.KeyRequest request = mMediaDrm.getKeyRequest(
-                session.array(), data, mime, MediaDrm.KEY_TYPE_STREAMING, optionalParameters);
+        if (optionalParameters == null) {
+            optionalParameters = new HashMap<String, String>();
+        }
+
+        MediaDrm.KeyRequest request = null;
+
+        try {
+            byte[] scopeId =
+                    keyType == MediaDrm.KEY_TYPE_RELEASE ? sessionId.keySetId() : sessionId.drmId();
+            assert scopeId != null;
+            request = mMediaDrm.getKeyRequest(scopeId, data, mime, keyType, optionalParameters);
+        } catch (IllegalStateException e) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP && e
+                    instanceof android.media.MediaDrm.MediaDrmStateException) {
+                // See b/21307186 for details.
+                Log.e(TAG, "MediaDrmStateException fired during getKeyRequest().", e);
+            }
+        }
+
         String result = (request != null) ? "successed" : "failed";
-        Log.d(TAG, "getKeyRequest " + result + "!");
+        Log.d(TAG, "getKeyRequest %s!", result);
+
         return request;
     }
 
     /**
      * Save data to |mPendingCreateSessionDataQueue| so that we can resume the
      * createSession() call later.
+     *
+     * @param initData Data needed to generate the key request.
+     * @param mime Mime type.
+     * @param keyType Key type.
+     * @param optionalParameters Optional parameters to pass to the DRM plugin.
+     * @param promiseId Promise ID for the createSession() call.
      */
-    private void savePendingCreateSessionData(int sessionId, byte[] initData, String mime) {
+    private void savePendingCreateSessionData(byte[] initData, String mime, int keyType,
+            HashMap<String, String> optionalParameters, long promiseId) {
         Log.d(TAG, "savePendingCreateSessionData()");
-        mPendingCreateSessionDataQueue.offer(
-                new PendingCreateSessionData(sessionId, initData, mime));
+
+        mPendingCreateSessionDataQueue.offer(new PendingCreateSessionData(
+                initData, mime, keyType, optionalParameters, promiseId));
     }
 
     /**
@@ -430,204 +681,384 @@ class MediaDrmBridge {
         // Check mMediaDrm != null because error may happen in createSession().
         // Check !mProvisioningPending because NotProvisionedException may be
         // thrown in createSession().
-        while (mMediaDrm != null && !mProvisioningPending &&
-                !mPendingCreateSessionDataQueue.isEmpty()) {
+        while (mMediaDrm != null && !mProvisioningPending
+                && !mPendingCreateSessionDataQueue.isEmpty()) {
             PendingCreateSessionData pendingData = mPendingCreateSessionDataQueue.poll();
-            int sessionId = pendingData.sessionId();
             byte[] initData = pendingData.initData();
             String mime = pendingData.mimeType();
-            createSession(sessionId, initData, mime);
+            int keyType = pendingData.keyType();
+            HashMap<String, String> optionalParameters = pendingData.optionalParameters();
+            long promiseId = pendingData.promiseId();
+            createSession(initData, mime, keyType, optionalParameters, promiseId);
         }
     }
 
     /**
-     * Process pending operations asynchrnously.
+     * createSession interface to be called from native using primitive types.
+     * @see createSession(byte[], String, HashMap<String, String>, long)
      */
-    private void resumePendingOperations() {
-        mHandler.post(new Runnable(){
-            @Override
-            public void run() {
-                processPendingCreateSessionData();
+    @CalledByNative
+    private void createSessionFromNative(byte[] initData, String mime, int keyType,
+            String[] optionalParamsArray, long promiseId) {
+        HashMap<String, String> optionalParameters = new HashMap<String, String>();
+        if (optionalParamsArray != null) {
+            if (optionalParamsArray.length % 2 != 0) {
+                throw new IllegalArgumentException(
+                        "Additional data array doesn't have equal keys/values");
             }
-        });
+            for (int i = 0; i < optionalParamsArray.length; i += 2) {
+                optionalParameters.put(optionalParamsArray[i], optionalParamsArray[i + 1]);
+            }
+        }
+        createSession(initData, mime, keyType, optionalParameters, promiseId);
     }
 
     /**
-     * Create a session with |sessionId|, |initData| and |mime|.
-     * In multiple session mode, a new session will be open. In single session
-     * mode, the mMediaCryptoSession will be used.
+     * Create a session, and generate a request with |initData| and |mime|.
      *
-     * @param sessionId ID for the session to be created.
      * @param initData Data needed to generate the key request.
      * @param mime Mime type.
+     * @param keyType Key type.
+     * @param optionalParameters Additional data to pass to getKeyRequest.
+     * @param promiseId Promise ID for this call.
      */
-    @CalledByNative
-    private void createSession(int sessionId, byte[] initData, String mime) {
+    private void createSession(byte[] initData, String mime, int keyType,
+            HashMap<String, String> optionalParameters, long promiseId) {
         Log.d(TAG, "createSession()");
+
         if (mMediaDrm == null) {
             Log.e(TAG, "createSession() called when MediaDrm is null.");
+            onPromiseRejected(promiseId, "MediaDrm released previously.");
             return;
         }
 
         if (mProvisioningPending) {
-            assert mMediaCrypto == null;
-            savePendingCreateSessionData(sessionId, initData, mime);
+            savePendingCreateSessionData(initData, mime, keyType, optionalParameters, promiseId);
             return;
         }
 
+        assert mMediaCryptoSession != null;
+
         boolean newSessionOpened = false;
-        ByteBuffer session = null;
+        SessionId sessionId = null;
         try {
-            // Create MediaCrypto if necessary.
-            if (mMediaCrypto == null && !createMediaCrypto()) {
-              onSessionError(sessionId);
+            byte[] drmId = openSession();
+            if (drmId == null) {
+                onPromiseRejected(promiseId, "Open session failed.");
                 return;
             }
-            assert mMediaCrypto != null;
-            assert mSessionIds.containsKey(mMediaCryptoSession);
+            newSessionOpened = true;
+            assert keyType == MediaDrm.KEY_TYPE_STREAMING || keyType == MediaDrm.KEY_TYPE_OFFLINE;
+            sessionId = (keyType == MediaDrm.KEY_TYPE_OFFLINE)
+                    ? SessionId.createPersistentSessionId(drmId)
+                    : SessionId.createTemporarySessionId(drmId);
 
-            if (mSingleSessionMode) {
-                session = mMediaCryptoSession;
-                if (mSessionMimeTypes.get(session) != null &&
-                        !mSessionMimeTypes.get(session).equals(mime)) {
-                    Log.e(TAG, "Only one mime type is supported in single session mode.");
-                    onSessionError(sessionId);
-                    return;
-                }
-            } else {
-                session = openSession();
-                if (session == null) {
-                    Log.e(TAG, "Cannot open session in createSession().");
-                    onSessionError(sessionId);
-                    return;
-                }
-                newSessionOpened = true;
-                assert !mSessionIds.containsKey(session);
-            }
-
-            MediaDrm.KeyRequest request = null;
-            request = getKeyRequest(session, initData, mime);
+            MediaDrm.KeyRequest request =
+                    getKeyRequest(sessionId, initData, mime, keyType, optionalParameters);
             if (request == null) {
-                if (newSessionOpened) {
-                    closeSession(session);
-                }
-                onSessionError(sessionId);
+                closeSessionNoException(sessionId);
+                onPromiseRejected(promiseId, "Generate request failed.");
                 return;
             }
 
-            onSessionCreated(sessionId, getWebSessionId(session));
+            // Success!
+            Log.d(TAG, "createSession(): Session (%s) created.", sessionId.toHexString());
+            onPromiseResolvedWithSession(promiseId, sessionId);
             onSessionMessage(sessionId, request);
-            if (newSessionOpened) {
-                Log.d(TAG, "createSession(): Session " + getWebSessionId(session) +
-                        " (" + sessionId + ") created.");
-            }
-
-            mSessionIds.put(session, sessionId);
-            mSessionMimeTypes.put(session, mime);
+            mSessionManager.put(sessionId, mime, keyType);
         } catch (android.media.NotProvisionedException e) {
             Log.e(TAG, "Device not provisioned", e);
             if (newSessionOpened) {
-                closeSession(session);
+                closeSessionNoException(sessionId);
             }
-            savePendingCreateSessionData(sessionId, initData, mime);
+            savePendingCreateSessionData(initData, mime, keyType, optionalParameters, promiseId);
             startProvisioning();
         }
     }
 
     /**
-     * Returns whether |sessionId| is a valid key session, excluding the media
-     * crypto session in multi-session mode.
+     * Search and return the SessionId for raw EME/DRM session id.
      *
-     * @param sessionId Crypto session Id.
+     * @param emeId Raw EME session Id.
+     * @return SessionId of |emeId| if exists and isn't a MediaCryptoSession, null otherwise.
      */
-    private boolean sessionExists(ByteBuffer session) {
+    private SessionId getSessionIdByEmeId(byte[] emeId) {
         if (mMediaCryptoSession == null) {
-            assert mSessionIds.isEmpty();
             Log.e(TAG, "Session doesn't exist because media crypto session is not created.");
-            return false;
-        }
-        assert mSessionIds.containsKey(mMediaCryptoSession);
-
-        if (mSingleSessionMode) {
-            return mMediaCryptoSession.equals(session);
+            return null;
         }
 
-        return !session.equals(mMediaCryptoSession) && mSessionIds.containsKey(session);
+        SessionId sessionId = mSessionManager.getSessionIdByEmeId(emeId);
+        if (sessionId == null) {
+            return null;
+        }
+
+        assert !mMediaCryptoSession.isEqual(sessionId);
+
+        return sessionId;
     }
 
     /**
-     * Cancel a key request for a session Id.
-     *
-     * @param sessionId Reference ID of session to be released.
+     * Similar with getSessionIdByEmeId, just search for raw DRM session id.
      */
-    @CalledByNative
-    private void releaseSession(int sessionId) {
-        Log.d(TAG, "releaseSession(): " + sessionId);
-        if (mMediaDrm == null) {
-            Log.e(TAG, "releaseSession() called when MediaDrm is null.");
-            return;
+    private SessionId getSessionIdByDrmId(byte[] drmId) {
+        if (mMediaCryptoSession == null) {
+            Log.e(TAG, "Session doesn't exist because media crypto session is not created.");
+            return null;
         }
 
-        ByteBuffer session = getSession(sessionId);
-        if (session == null) {
-            Log.e(TAG, "Invalid sessionId in releaseSession.");
-            onSessionError(sessionId);
-            return;
+        SessionId sessionId = mSessionManager.getSessionIdByDrmId(drmId);
+        if (sessionId == null) {
+            return null;
         }
 
-        mMediaDrm.removeKeys(session.array());
+        assert !mMediaCryptoSession.isEqual(sessionId);
 
-        // We don't close the media crypto session in single session mode.
-        if (!mSingleSessionMode) {
-            Log.d(TAG, "Session " + sessionId + "closed.");
-            closeSession(session);
-            mSessionIds.remove(session);
-            onSessionClosed(sessionId);
-        }
+        return sessionId;
     }
 
     /**
-     * Add a key for a session Id.
+     * Close a session that was previously created by createSession().
      *
-     * @param sessionId Reference ID of session to be updated.
-     * @param key Response data from the server.
+     * @param emeSessionId ID of session to be closed.
+     * @param promiseId Promise ID of this call.
      */
     @CalledByNative
-    private void updateSession(int sessionId, byte[] key) {
-        Log.d(TAG, "updateSession(): " + sessionId);
+    private void closeSession(byte[] emeSessionId, long promiseId) {
+        Log.d(TAG, "closeSession()");
         if (mMediaDrm == null) {
-            Log.e(TAG, "updateSession() called when MediaDrm is null.");
+            onPromiseRejected(promiseId, "closeSession() called when MediaDrm is null.");
             return;
         }
 
-        // TODO(xhwang): We should be able to DCHECK this when WD EME is implemented.
-        ByteBuffer session = getSession(sessionId);
-        if (!sessionExists(session)) {
-            Log.e(TAG, "Invalid session in updateSession.");
-            onSessionError(sessionId);
+        SessionId sessionId = getSessionIdByEmeId(emeSessionId);
+        if (sessionId == null) {
+            onPromiseRejected(promiseId,
+                    "Invalid sessionId in closeSession(): " + SessionId.toHexString(emeSessionId));
             return;
         }
 
         try {
-            try {
-                mMediaDrm.provideKeyResponse(session.array(), key);
-            } catch (java.lang.IllegalStateException e) {
-                // This is not really an exception. Some error code are incorrectly
-                // reported as an exception.
-                // TODO(qinmin): remove this exception catch when b/10495563 is fixed.
-                Log.e(TAG, "Exception intentionally caught when calling provideKeyResponse()", e);
+            // Some implementations don't have removeKeys, crbug/475632
+            mMediaDrm.removeKeys(sessionId.drmId());
+        } catch (Exception e) {
+            Log.e(TAG, "removeKeys failed: ", e);
+        }
+
+        closeSessionNoException(sessionId);
+        mSessionManager.remove(sessionId);
+        onPromiseResolved(promiseId);
+        onSessionClosed(sessionId);
+        Log.d(TAG, "Session %s closed", sessionId.toHexString());
+    }
+
+    /**
+     * Close the session without worry about the exception, because some
+     * implementations let this method throw exception, crbug/611865.
+     */
+    private void closeSessionNoException(SessionId sessionId) {
+        try {
+            mMediaDrm.closeSession(sessionId.drmId());
+        } catch (Exception e) {
+            Log.e(TAG, "closeSession failed: ", e);
+        }
+    }
+
+    /**
+     * Update a session with response.
+     *
+     * @param emeSessionId Reference ID of session to be updated.
+     * @param response Response data from the server.
+     * @param promiseId Promise ID of this call.
+     */
+    @CalledByNative
+    private void updateSession(byte[] emeSessionId, byte[] response, final long promiseId) {
+        Log.d(TAG, "updateSession()");
+        if (mMediaDrm == null) {
+            onPromiseRejected(promiseId, "updateSession() called when MediaDrm is null.");
+            return;
+        }
+
+        final SessionId sessionId = getSessionIdByEmeId(emeSessionId);
+        if (sessionId == null) {
+            assert false; // Should never happen.
+            onPromiseRejected(promiseId,
+                    "Invalid session in updateSession: " + SessionId.toHexString(emeSessionId));
+            return;
+        }
+
+        try {
+            SessionInfo sessionInfo = mSessionManager.get(sessionId);
+            boolean isKeyRelease = sessionInfo.keyType() == MediaDrm.KEY_TYPE_RELEASE;
+
+            byte[] keySetId = null;
+            if (isKeyRelease) {
+                Log.d(TAG, "updateSession() for key release");
+                assert sessionId.keySetId() != null;
+                mMediaDrm.provideKeyResponse(sessionId.keySetId(), response);
+            } else {
+                keySetId = mMediaDrm.provideKeyResponse(sessionId.drmId(), response);
             }
-            onSessionReady(sessionId);
-            Log.d(TAG, "Key successfully added for session " + sessionId);
+
+            KeyUpdatedCallback cb = new KeyUpdatedCallback(sessionId, promiseId, isKeyRelease);
+
+            if (isKeyRelease) {
+                mSessionManager.clearPersistentSessionInfo(sessionId, cb);
+            } else if (sessionInfo.keyType() == MediaDrm.KEY_TYPE_OFFLINE && keySetId != null
+                    && keySetId.length > 0) {
+                mSessionManager.setKeySetId(sessionId, keySetId, cb);
+            } else {
+                // This can be either temporary license update or server certificate update.
+                cb.onResult(true);
+            }
+
             return;
         } catch (android.media.NotProvisionedException e) {
             // TODO(xhwang): Should we handle this?
             Log.e(TAG, "failed to provide key response", e);
         } catch (android.media.DeniedByServerException e) {
             Log.e(TAG, "failed to provide key response", e);
+        } catch (java.lang.IllegalStateException e) {
+            Log.e(TAG, "failed to provide key response", e);
         }
-        onSessionError(sessionId);
+        onPromiseRejected(promiseId, "Update session failed.");
         release();
+    }
+
+    /**
+     * Load persistent license from storage.
+     */
+    @CalledByNative
+    private void loadSession(byte[] emeId, final long promiseId) {
+        Log.d(TAG, "loadSession()");
+        if (mProvisioningPending) {
+            onPersistentLicenseNoExist(promiseId);
+            return;
+        }
+
+        mSessionManager.load(emeId, new Callback<SessionId>() {
+            @Override
+            public void onResult(SessionId sessionId) {
+                if (sessionId == null) {
+                    onPersistentLicenseNoExist(promiseId);
+                    return;
+                }
+
+                loadSessionWithLoadedStorage(sessionId, promiseId);
+            }
+        });
+    }
+
+    /**
+     * Load session back to memory with MediaDrm. Load persistent storage
+     * before calling this. It will fail if persistent storage isn't loaded.
+     */
+    private void loadSessionWithLoadedStorage(SessionId sessionId, final long promiseId) {
+        byte[] drmId = null;
+        try {
+            drmId = openSession();
+            if (drmId == null) {
+                onPromiseRejected(promiseId, "Failed to open session to load license");
+                return;
+            }
+
+            mSessionManager.setDrmId(sessionId, drmId);
+
+            // Defer event handlers until license is loaded.
+            assert mSessionEventDeferrer == null;
+            mSessionEventDeferrer = new SessionEventDeferrer(sessionId);
+
+            assert sessionId.keySetId() != null;
+            mMediaDrm.restoreKeys(sessionId.drmId(), sessionId.keySetId());
+
+            onPromiseResolvedWithSession(promiseId, sessionId);
+
+            mSessionEventDeferrer.fire();
+            mSessionEventDeferrer = null;
+
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) {
+                onSessionKeysChange(sessionId,
+                        getDummyKeysInfo(MediaDrm.KeyStatus.STATUS_USABLE).toArray(), true, false);
+            }
+        } catch (android.media.NotProvisionedException e) {
+            // If device isn't provisioned, storage loading should fail.
+            assert false;
+        } catch (java.lang.IllegalStateException e) {
+            // license doesn't exist
+            if (sessionId.drmId() == null) {
+                // TODO(yucliu): Check if the license is released or doesn't exist.
+                onPersistentLicenseNoExist(promiseId);
+                return;
+            }
+
+            closeSessionNoException(sessionId);
+            mSessionManager.clearPersistentSessionInfo(sessionId, new Callback<Boolean>() {
+                @Override
+                public void onResult(Boolean success) {
+                    if (!success) {
+                        Log.w(TAG, "Failed to clear persistent storage for non-exist license");
+                    }
+
+                    onPersistentLicenseNoExist(promiseId);
+                }
+            });
+        }
+    }
+
+    private void onPersistentLicenseNoExist(long promiseId) {
+        // Chromium CDM API requires resolve the promise with empty session id for non-exist
+        // license. See media/base/content_decryption_module.h LoadSession for more details.
+        onPromiseResolvedWithSession(promiseId, SessionId.createNoExistSessionId());
+    }
+
+    /**
+     * Remove session from device. This will mark the key as released and
+     * generate a key release request. The license is removed from the device
+     * when the session is updated with a license release response.
+     */
+    @CalledByNative
+    private void removeSession(byte[] emeId, long promiseId) {
+        Log.d(TAG, "removeSession()");
+        SessionId sessionId = getSessionIdByEmeId(emeId);
+
+        if (sessionId == null) {
+            onPromiseRejected(promiseId, "Session doesn't exist");
+            return;
+        }
+
+        SessionInfo sessionInfo = mSessionManager.get(sessionId);
+        if (sessionInfo.keyType() != MediaDrm.KEY_TYPE_OFFLINE) {
+            // TODO(yucliu): Support 'remove' of temporary session.
+            onPromiseRejected(promiseId, "Removing temporary session isn't implemented");
+            return;
+        }
+
+        assert sessionId.keySetId() != null;
+
+        mSessionManager.markKeyReleased(sessionId);
+
+        try {
+            // Get key release request.
+            MediaDrm.KeyRequest request = getKeyRequest(
+                    sessionId, null, sessionInfo.mimeType(), MediaDrm.KEY_TYPE_RELEASE, null);
+
+            if (request == null) {
+                onPromiseRejected(promiseId, "Fail to generate key release request");
+                return;
+            }
+
+            // According to EME spec:
+            // https://www.w3.org/TR/encrypted-media/#dom-mediakeysession-remove
+            // 5.5 ... run the Queue a "message" Event ...
+            // 5.6 Resolve promise
+            // Since event is queued, JS will receive event after promise is
+            // resolved. So resolve the promise before firing the event here.
+            onPromiseResolved(promiseId);
+            onSessionMessage(sessionId, request);
+        } catch (android.media.NotProvisionedException e) {
+            Log.e(TAG, "removeSession called on unprovisioned device");
+            onPromiseRejected(promiseId, "Unknown failure");
+        }
     }
 
     /**
@@ -635,52 +1066,83 @@ class MediaDrmBridge {
      */
     @CalledByNative
     private String getSecurityLevel() {
-        if (mMediaDrm == null) {
-            Log.e(TAG, "getSecurityLevel() called when MediaDrm is null.");
-            return null;
+        if (mMediaDrm == null || !isWidevine()) {
+            Log.e(TAG, "getSecurityLevel(): MediaDrm is null or security level is not supported.");
+            return "";
         }
         return mMediaDrm.getPropertyString("securityLevel");
     }
 
     private void startProvisioning() {
+        if (mProvisioningPending) {
+            Log.d(TAG, "startProvisioning: another provisioning is in progress, returning");
+            return;
+        }
+
         Log.d(TAG, "startProvisioning");
-        assert mMediaDrm != null;
-        assert !mProvisioningPending;
         mProvisioningPending = true;
+        assert mMediaDrm != null;
         MediaDrm.ProvisionRequest request = mMediaDrm.getProvisionRequest();
-        PostRequestTask postTask = new PostRequestTask(request.getData());
-        postTask.execute(request.getDefaultUrl());
+
+        if (isNativeMediaDrmBridgeValid()) {
+            nativeOnStartProvisioning(
+                    mNativeMediaDrmBridge, request.getDefaultUrl(), request.getData());
+        }
     }
 
     /**
      * Called when the provision response is received.
      *
+     * @param isResponseReceived Flag set to true if commincation with provision server was
+     * successful.
      * @param response Response data from the provision server.
      */
-    private void onProvisionResponse(byte[] response) {
-        Log.d(TAG, "onProvisionResponse()");
-        assert mProvisioningPending;
-        mProvisioningPending = false;
+    @CalledByNative
+    private void processProvisionResponse(boolean isResponseReceived, byte[] response) {
+        Log.d(TAG, "processProvisionResponse()");
 
         // If |mMediaDrm| is released, there is no need to callback native.
         if (mMediaDrm == null) {
             return;
         }
 
-        boolean success = provideProvisionResponse(response);
+        assert mProvisioningPending;
+        mProvisioningPending = false;
+
+        boolean success = isResponseReceived ? provideProvisionResponse(response) : false;
 
         if (mResetDeviceCredentialsPending) {
-            nativeOnResetDeviceCredentialsCompleted(mNativeMediaDrmBridge, success);
+            onResetDeviceCredentialsCompleted(success);
             mResetDeviceCredentialsPending = false;
         }
 
-        if (success) {
-            resumePendingOperations();
+        if (!success || (mMediaCryptoSession == null && !createMediaCrypto())) {
+            release();
+            return;
         }
+
+        if (!mOriginSet) {
+            processPendingCreateSessionData();
+            return;
+        }
+
+        mStorage.onProvisioned(new Callback<Boolean>() {
+            @Override
+            public void onResult(Boolean initSuccess) {
+                if (!initSuccess) {
+                    Log.e(TAG, "Failed to initialize storage for origin");
+                    release();
+                    return;
+                }
+
+                processPendingCreateSessionData();
+            }
+        });
     }
 
     /**
-     * Provide the provisioning response to MediaDrm.
+     * Provides the provision response to MediaDrm.
+     *
      * @returns false if the response is invalid or on error, true otherwise.
      */
     boolean provideProvisionResponse(byte[] response) {
@@ -700,96 +1162,120 @@ class MediaDrmBridge {
         return false;
     }
 
-    private void onSessionCreated(final int sessionId, final String webSessionId) {
-        mHandler.post(new Runnable(){
-            @Override
-            public void run() {
-                nativeOnSessionCreated(mNativeMediaDrmBridge, sessionId, webSessionId);
-            }
-        });
-    }
-
-    private void onSessionMessage(final int sessionId, final MediaDrm.KeyRequest request) {
-        mHandler.post(new Runnable(){
-            @Override
-            public void run() {
-                nativeOnSessionMessage(mNativeMediaDrmBridge, sessionId,
-                        request.getData(), request.getDefaultUrl());
-            }
-        });
-    }
-
-    private void onSessionReady(final int sessionId) {
-        mHandler.post(new Runnable() {
-            @Override
-            public void run() {
-                nativeOnSessionReady(mNativeMediaDrmBridge, sessionId);
-            }
-        });
-    }
-
-    private void onSessionClosed(final int sessionId) {
-        mHandler.post(new Runnable() {
-            @Override
-            public void run() {
-                nativeOnSessionClosed(mNativeMediaDrmBridge, sessionId);
-            }
-        });
-    }
-
-    private void onSessionError(final int sessionId) {
-        // TODO(qinmin): pass the error code to native.
-        mHandler.post(new Runnable() {
-            @Override
-            public void run() {
-                nativeOnSessionError(mNativeMediaDrmBridge, sessionId);
-            }
-        });
-    }
-
-    private String getWebSessionId(ByteBuffer session) {
-        String webSessionId = null;
-        try {
-            webSessionId = new String(session.array(), "UTF-8");
-        } catch (java.io.UnsupportedEncodingException e) {
-            Log.e(TAG, "getWebSessionId failed", e);
-        } catch (java.lang.NullPointerException e) {
-            Log.e(TAG, "getWebSessionId failed", e);
+    /**
+     * Delay session event handler if |mSessionEventDeferrer| exists and
+     * matches |sessionId|. Otherwise run the handler immediately.
+     */
+    private void deferEventHandleIfNeeded(SessionId sessionId, Runnable handler) {
+        if (mSessionEventDeferrer != null && mSessionEventDeferrer.shouldDefer(sessionId)) {
+            mSessionEventDeferrer.defer(handler);
+            return;
         }
-        return webSessionId;
+
+        handler.run();
     }
 
-    private class MediaDrmListener implements MediaDrm.OnEventListener {
+    // Helper functions to make native calls.
+
+    private void onMediaCryptoReady(MediaCrypto mediaCrypto) {
+        if (isNativeMediaDrmBridgeValid()) {
+            nativeOnMediaCryptoReady(mNativeMediaDrmBridge, mediaCrypto);
+        }
+    }
+
+    private void onPromiseResolved(final long promiseId) {
+        if (isNativeMediaDrmBridgeValid()) {
+            nativeOnPromiseResolved(mNativeMediaDrmBridge, promiseId);
+        }
+    }
+
+    private void onPromiseResolvedWithSession(final long promiseId, final SessionId sessionId) {
+        if (isNativeMediaDrmBridgeValid()) {
+            nativeOnPromiseResolvedWithSession(mNativeMediaDrmBridge, promiseId, sessionId.emeId());
+        }
+    }
+
+    private void onPromiseRejected(final long promiseId, final String errorMessage) {
+        Log.e(TAG, "onPromiseRejected: %s", errorMessage);
+        if (isNativeMediaDrmBridgeValid()) {
+            nativeOnPromiseRejected(mNativeMediaDrmBridge, promiseId, errorMessage);
+        }
+    }
+
+    @TargetApi(Build.VERSION_CODES.M)
+    private void onSessionMessage(final SessionId sessionId, final MediaDrm.KeyRequest request) {
+        if (!isNativeMediaDrmBridgeValid()) return;
+
+        int requestType = MediaDrm.KeyRequest.REQUEST_TYPE_INITIAL;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            requestType = request.getRequestType();
+        } else {
+            // Prior to M, getRequestType() is not supported. Do our best guess here: Assume
+            // requests with a URL are renewals and all others are initial requests.
+            requestType = request.getDefaultUrl().isEmpty()
+                    ? MediaDrm.KeyRequest.REQUEST_TYPE_INITIAL
+                    : MediaDrm.KeyRequest.REQUEST_TYPE_RENEWAL;
+        }
+
+        nativeOnSessionMessage(
+                mNativeMediaDrmBridge, sessionId.emeId(), requestType, request.getData());
+    }
+
+    private void onSessionClosed(final SessionId sessionId) {
+        if (isNativeMediaDrmBridgeValid()) {
+            nativeOnSessionClosed(mNativeMediaDrmBridge, sessionId.emeId());
+        }
+    }
+
+    private void onSessionKeysChange(final SessionId sessionId, final Object[] keysInfo,
+            final boolean hasAdditionalUsableKey, final boolean isKeyRelease) {
+        if (isNativeMediaDrmBridgeValid()) {
+            nativeOnSessionKeysChange(mNativeMediaDrmBridge, sessionId.emeId(), keysInfo,
+                    hasAdditionalUsableKey, isKeyRelease);
+        }
+    }
+
+    private void onSessionExpirationUpdate(final SessionId sessionId, final long expirationTime) {
+        if (isNativeMediaDrmBridgeValid()) {
+            nativeOnSessionExpirationUpdate(
+                    mNativeMediaDrmBridge, sessionId.emeId(), expirationTime);
+        }
+    }
+
+    private void onResetDeviceCredentialsCompleted(final boolean success) {
+        if (isNativeMediaDrmBridgeValid()) {
+            nativeOnResetDeviceCredentialsCompleted(mNativeMediaDrmBridge, success);
+        }
+    }
+
+    @MainDex
+    private class EventListener implements MediaDrm.OnEventListener {
         @Override
         public void onEvent(
-                MediaDrm mediaDrm, byte[] session_array, int event, int extra, byte[] data) {
-            if (session_array == null) {
-                Log.e(TAG, "MediaDrmListener: Null session.");
+                MediaDrm mediaDrm, byte[] drmSessionId, int event, int extra, byte[] data) {
+            if (drmSessionId == null) {
+                Log.e(TAG, "EventListener: Null session.");
                 return;
             }
-            ByteBuffer session = ByteBuffer.wrap(session_array);
-            if (!sessionExists(session)) {
-                Log.e(TAG, "MediaDrmListener: Invalid session.");
+            SessionId sessionId = getSessionIdByDrmId(drmSessionId);
+
+            if (sessionId == null) {
+                Log.e(TAG, "EventListener: Invalid session %s",
+                        SessionId.toHexString(drmSessionId));
                 return;
             }
-            Integer sessionId = mSessionIds.get(session);
-            if (sessionId == null || sessionId == INVALID_SESSION_ID) {
-                Log.e(TAG, "MediaDrmListener: Invalid session ID.");
-                return;
-            }
+
+            SessionInfo sessionInfo = mSessionManager.get(sessionId);
             switch(event) {
-                case MediaDrm.EVENT_PROVISION_REQUIRED:
-                    Log.d(TAG, "MediaDrm.EVENT_PROVISION_REQUIRED");
-                    break;
                 case MediaDrm.EVENT_KEY_REQUIRED:
                     Log.d(TAG, "MediaDrm.EVENT_KEY_REQUIRED");
                     if (mProvisioningPending) {
                         return;
                     }
-                    String mime = mSessionMimeTypes.get(session);
                     MediaDrm.KeyRequest request = null;
                     try {
-                        request = getKeyRequest(session, data, mime);
+                        request = getKeyRequest(sessionId, data, sessionInfo.mimeType(),
+                                sessionInfo.keyType(), null);
                     } catch (android.media.NotProvisionedException e) {
                         Log.e(TAG, "Device not provisioned", e);
                         startProvisioning();
@@ -798,12 +1284,23 @@ class MediaDrmBridge {
                     if (request != null) {
                         onSessionMessage(sessionId, request);
                     } else {
-                        onSessionError(sessionId);
+                        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) {
+                            onSessionKeysChange(sessionId,
+                                    getDummyKeysInfo(MediaDrm.KeyStatus.STATUS_INTERNAL_ERROR)
+                                            .toArray(),
+                                    false, false);
+                        }
+                        Log.e(TAG, "EventListener: getKeyRequest failed.");
+                        return;
                     }
                     break;
                 case MediaDrm.EVENT_KEY_EXPIRED:
                     Log.d(TAG, "MediaDrm.EVENT_KEY_EXPIRED");
-                    onSessionError(sessionId);
+                    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) {
+                        onSessionKeysChange(sessionId,
+                                getDummyKeysInfo(MediaDrm.KeyStatus.STATUS_EXPIRED).toArray(),
+                                false, sessionInfo.keyType() == MediaDrm.KEY_TYPE_RELEASE);
+                    }
                     break;
                 case MediaDrm.EVENT_VENDOR_DEFINED:
                     Log.d(TAG, "MediaDrm.EVENT_VENDOR_DEFINED");
@@ -816,75 +1313,114 @@ class MediaDrmBridge {
         }
     }
 
-    private class PostRequestTask extends AsyncTask<String, Void, Void> {
-        private static final String TAG = "PostRequestTask";
-
-        private byte[] mDrmRequest;
-        private byte[] mResponseBody;
-
-        public PostRequestTask(byte[] drmRequest) {
-            mDrmRequest = drmRequest;
+    @TargetApi(Build.VERSION_CODES.M)
+    @MainDex
+    private class KeyStatusChangeListener implements MediaDrm.OnKeyStatusChangeListener {
+        private List<KeyStatus> getKeysInfo(List<MediaDrm.KeyStatus> keyInformation) {
+            List<KeyStatus> keysInfo = new ArrayList<KeyStatus>();
+            for (MediaDrm.KeyStatus keyStatus : keyInformation) {
+                keysInfo.add(new KeyStatus(keyStatus.getKeyId(), keyStatus.getStatusCode()));
+            }
+            return keysInfo;
         }
 
         @Override
-        protected Void doInBackground(String... urls) {
-            mResponseBody = postRequest(urls[0], mDrmRequest);
-            if (mResponseBody != null) {
-                Log.d(TAG, "response length=" + mResponseBody.length);
-            }
-            return null;
-        }
+        public void onKeyStatusChange(MediaDrm md, byte[] drmSessionId,
+                final List<MediaDrm.KeyStatus> keyInformation, final boolean hasNewUsableKey) {
+            final SessionId sessionId = getSessionIdByDrmId(drmSessionId);
 
-        private byte[] postRequest(String url, byte[] drmRequest) {
-            HttpClient httpClient = new DefaultHttpClient();
-            HttpPost httpPost = new HttpPost(url + "&signedRequest=" + new String(drmRequest));
+            assert sessionId != null;
+            assert mSessionManager.get(sessionId) != null;
 
-            Log.d(TAG, "PostRequest:" + httpPost.getRequestLine());
-            try {
-                // Add data
-                httpPost.setHeader("Accept", "*/*");
-                httpPost.setHeader("User-Agent", "Widevine CDM v1.0");
-                httpPost.setHeader("Content-Type", "application/json");
+            final boolean isKeyRelease =
+                    mSessionManager.get(sessionId).keyType() == MediaDrm.KEY_TYPE_RELEASE;
 
-                // Execute HTTP Post Request
-                HttpResponse response = httpClient.execute(httpPost);
-
-                byte[] responseBody;
-                int responseCode = response.getStatusLine().getStatusCode();
-                if (responseCode == 200) {
-                    responseBody = EntityUtils.toByteArray(response.getEntity());
-                } else {
-                    Log.d(TAG, "Server returned HTTP error code " + responseCode);
-                    return null;
+            deferEventHandleIfNeeded(sessionId, new Runnable() {
+                @Override
+                public void run() {
+                    Log.d(TAG,
+                            "KeysStatusChange: " + sessionId.toHexString() + ", "
+                                    + hasNewUsableKey);
+                    onSessionKeysChange(sessionId, getKeysInfo(keyInformation).toArray(),
+                            hasNewUsableKey, isKeyRelease);
                 }
-                return responseBody;
-            } catch (ClientProtocolException e) {
-                e.printStackTrace();
-            } catch (IOException e) {
-                e.printStackTrace();
-            }
-            return null;
-        }
-
-        @Override
-        protected void onPostExecute(Void v) {
-            onProvisionResponse(mResponseBody);
+            });
         }
     }
 
-    private native void nativeOnMediaCryptoReady(long nativeMediaDrmBridge);
+    @TargetApi(Build.VERSION_CODES.M)
+    @MainDex
+    private class ExpirationUpdateListener implements MediaDrm.OnExpirationUpdateListener {
+        @Override
+        public void onExpirationUpdate(
+                MediaDrm md, byte[] drmSessionId, final long expirationTime) {
+            final SessionId sessionId = getSessionIdByDrmId(drmSessionId);
 
-    private native void nativeOnSessionCreated(long nativeMediaDrmBridge, int sessionId,
-                                               String webSessionId);
+            assert sessionId != null;
 
-    private native void nativeOnSessionMessage(long nativeMediaDrmBridge, int sessionId,
-                                               byte[] message, String destinationUrl);
+            deferEventHandleIfNeeded(sessionId, new Runnable() {
+                @Override
+                public void run() {
+                    Log.d(TAG,
+                            "ExpirationUpdate: " + sessionId.toHexString() + ", " + expirationTime);
+                    onSessionExpirationUpdate(sessionId, expirationTime);
+                }
+            });
+        }
+    }
 
-    private native void nativeOnSessionReady(long nativeMediaDrmBridge, int sessionId);
+    @MainDex
+    private class KeyUpdatedCallback implements Callback<Boolean> {
+        private final SessionId mSessionId;
+        private final long mPromiseId;
+        private final boolean mIsKeyRelease;
 
-    private native void nativeOnSessionClosed(long nativeMediaDrmBridge, int sessionId);
+        KeyUpdatedCallback(SessionId sessionId, long promiseId, boolean isKeyRelease) {
+            mSessionId = sessionId;
+            mPromiseId = promiseId;
+            mIsKeyRelease = isKeyRelease;
+        }
 
-    private native void nativeOnSessionError(long nativeMediaDrmBridge, int sessionId);
+        @Override
+        public void onResult(Boolean success) {
+            if (!success) {
+                onPromiseRejected(mPromiseId, "failed to update key after response accepted");
+                return;
+            }
+
+            Log.d(TAG, "Key successfully %s for session %s", mIsKeyRelease ? "released" : "added",
+                    mSessionId.toHexString());
+            onPromiseResolved(mPromiseId);
+
+            if (!mIsKeyRelease && Build.VERSION.SDK_INT < Build.VERSION_CODES.M) {
+                onSessionKeysChange(mSessionId,
+                        getDummyKeysInfo(MediaDrm.KeyStatus.STATUS_USABLE).toArray(), true,
+                        mIsKeyRelease);
+            }
+        }
+    }
+
+    // Native functions. At the native side, must post the task immediately to
+    // avoid reentrancy issues.
+    private native void nativeOnMediaCryptoReady(
+            long nativeMediaDrmBridge, MediaCrypto mediaCrypto);
+
+    private native void nativeOnStartProvisioning(
+            long nativeMediaDrmBridge, String defaultUrl, byte[] requestData);
+
+    private native void nativeOnPromiseResolved(long nativeMediaDrmBridge, long promiseId);
+    private native void nativeOnPromiseResolvedWithSession(
+            long nativeMediaDrmBridge, long promiseId, byte[] emeSessionId);
+    private native void nativeOnPromiseRejected(
+            long nativeMediaDrmBridge, long promiseId, String errorMessage);
+
+    private native void nativeOnSessionMessage(
+            long nativeMediaDrmBridge, byte[] emeSessionId, int requestType, byte[] message);
+    private native void nativeOnSessionClosed(long nativeMediaDrmBridge, byte[] emeSessionId);
+    private native void nativeOnSessionKeysChange(long nativeMediaDrmBridge, byte[] emeSessionId,
+            Object[] keysInfo, boolean hasAdditionalUsableKey, boolean isKeyRelease);
+    private native void nativeOnSessionExpirationUpdate(
+            long nativeMediaDrmBridge, byte[] emeSessionId, long expirationTime);
 
     private native void nativeOnResetDeviceCredentialsCompleted(
             long nativeMediaDrmBridge, boolean success);

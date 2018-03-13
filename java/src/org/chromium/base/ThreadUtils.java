@@ -8,6 +8,8 @@ import android.os.Handler;
 import android.os.Looper;
 import android.os.Process;
 
+import org.chromium.base.annotations.CalledByNative;
+
 import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.FutureTask;
@@ -19,9 +21,11 @@ public class ThreadUtils {
 
     private static final Object sLock = new Object();
 
-    private static boolean sWillOverride = false;
+    private static boolean sWillOverride;
 
-    private static Handler sUiThreadHandler = null;
+    private static Handler sUiThreadHandler;
+
+    private static boolean sThreadAssertsDisabled;
 
     public static void setWillOverrideUiThread() {
         synchronized (sLock) {
@@ -29,12 +33,18 @@ public class ThreadUtils {
         }
     }
 
+    @VisibleForTesting
     public static void setUiThread(Looper looper) {
         synchronized (sLock) {
+            if (looper == null) {
+                // Used to reset the looper after tests.
+                sUiThreadHandler = null;
+                return;
+            }
             if (sUiThreadHandler != null && sUiThreadHandler.getLooper() != looper) {
-                throw new RuntimeException("UI thread looper is already set to " +
-                        sUiThreadHandler.getLooper() + " (Main thread looper is " +
-                        Looper.getMainLooper() + "), cannot set to new looper " + looper);
+                throw new RuntimeException("UI thread looper is already set to "
+                        + sUiThreadHandler.getLooper() + " (Main thread looper is "
+                        + Looper.getMainLooper() + "), cannot set to new looper " + looper);
             } else {
                 sUiThreadHandler = new Handler(looper);
             }
@@ -68,7 +78,7 @@ public class ThreadUtils {
             try {
                 task.get();
             } catch (Exception e) {
-                throw new RuntimeException("Exception occured while waiting for runnable", e);
+                throw new RuntimeException("Exception occurred while waiting for runnable", e);
             }
         }
     }
@@ -80,11 +90,12 @@ public class ThreadUtils {
      * @param c The Callable to run
      * @return The result of the callable
      */
+    @VisibleForTesting
     public static <T> T runOnUiThreadBlockingNoException(Callable<T> c) {
         try {
             return runOnUiThreadBlocking(c);
         } catch (ExecutionException e) {
-            throw new RuntimeException("Error occured waiting for callable", e);
+            throw new RuntimeException("Error occurred waiting for callable", e);
         }
     }
 
@@ -176,15 +187,55 @@ public class ThreadUtils {
      * @param task The Runnable to run
      * @param delayMillis The delay in milliseconds until the Runnable will be run
      */
+    @VisibleForTesting
     public static void postOnUiThreadDelayed(Runnable task, long delayMillis) {
         getUiThreadHandler().postDelayed(task, delayMillis);
     }
 
     /**
-     * Asserts that the current thread is running on the main thread.
+     * Throw an exception (when DCHECKs are enabled) if currently not running on the UI thread.
+     *
+     * Can be disabled by setThreadAssertsDisabledForTesting(true).
      */
     public static void assertOnUiThread() {
-        assert runningOnUiThread();
+        if (sThreadAssertsDisabled) return;
+
+        assert runningOnUiThread() : "Must be called on the UI thread.";
+    }
+
+    /**
+     * Throw an exception (regardless of build) if currently not running on the UI thread.
+     *
+     * Can be disabled by setThreadAssertsEnabledForTesting(false).
+     *
+     * @see #assertOnUiThread()
+     */
+    public static void checkUiThread() {
+        if (!sThreadAssertsDisabled && !runningOnUiThread()) {
+            throw new IllegalStateException("Must be called on the UI thread.");
+        }
+    }
+
+    /**
+     * Throw an exception (when DCHECKs are enabled) if currently running on the UI thread.
+     *
+     * Can be disabled by setThreadAssertsDisabledForTesting(true).
+     */
+    public static void assertOnBackgroundThread() {
+        if (sThreadAssertsDisabled) return;
+
+        assert !runningOnUiThread() : "Must be called on a thread other than UI.";
+    }
+
+    /**
+     * Disables thread asserts.
+     *
+     * Can be used by tests where code that normally runs multi-threaded is going to run
+     * single-threaded for the test (otherwise asserts that are valid in production would fail in
+     * those tests).
+     */
+    public static void setThreadAssertsDisabledForTesting(boolean disabled) {
+        sThreadAssertsDisabled = disabled;
     }
 
     /**
@@ -204,5 +255,15 @@ public class ThreadUtils {
     @CalledByNative
     public static void setThreadPriorityAudio(int tid) {
         Process.setThreadPriority(tid, Process.THREAD_PRIORITY_AUDIO);
+    }
+
+    /**
+     * Checks whether Thread priority is THREAD_PRIORITY_AUDIO or not.
+     * @param tid Thread id.
+     * @return true for THREAD_PRIORITY_AUDIO and false otherwise.
+     */
+    @CalledByNative
+    private static boolean isThreadPriorityAudio(int tid) {
+        return Process.getThreadPriority(tid) == Process.THREAD_PRIORITY_AUDIO;
     }
 }

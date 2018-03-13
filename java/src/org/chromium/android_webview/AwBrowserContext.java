@@ -12,25 +12,26 @@ import org.chromium.content.browser.ContentViewStatics;
 /**
  * Java side of the Browser Context: contains all the java side objects needed to host one
  * browing session (i.e. profile).
- * Note that due to running in single process mode, and limitations on renderer process only
- * being able to use a single browser context, currently there can only be one AwBrowserContext
- * instance, so at this point the class mostly exists for conceptual clarity.
  *
- * Obtain the default (singleton) instance with  AwBrowserProcess.getDefaultBrowserContext().
+ * Note that historically WebView was running in single process mode, and limitations on renderer
+ * process only being able to use a single browser context, currently there can only be one
+ * AwBrowserContext instance, so at this point the class mostly exists for conceptual clarity.
  */
 public class AwBrowserContext {
-
-    private static final String HTTP_AUTH_DATABASE_FILE = "http_auth.db";
-
-    private SharedPreferences mSharedPreferences;
+    private static final String TAG = "AwBrowserContext";
+    private final SharedPreferences mSharedPreferences;
 
     private AwGeolocationPermissions mGeolocationPermissions;
-    private AwCookieManager mCookieManager;
     private AwFormDatabase mFormDatabase;
-    private HttpAuthDatabase mHttpAuthDatabase;
+    private AwServiceWorkerController mServiceWorkerController;
+    private AwTracingController mTracingController;
+    private Context mApplicationContext;
 
-    public AwBrowserContext(SharedPreferences sharedPreferences) {
+    public AwBrowserContext(SharedPreferences sharedPreferences, Context applicationContext) {
         mSharedPreferences = sharedPreferences;
+        mApplicationContext = applicationContext;
+
+        PlatformServiceBridge.getInstance().setSafeBrowsingHandler();
     }
 
     public AwGeolocationPermissions getGeolocationPermissions() {
@@ -40,13 +41,6 @@ public class AwBrowserContext {
         return mGeolocationPermissions;
     }
 
-    public AwCookieManager getCookieManager() {
-        if (mCookieManager == null) {
-            mCookieManager = new AwCookieManager();
-        }
-        return mCookieManager;
-    }
-
     public AwFormDatabase getFormDatabase() {
         if (mFormDatabase == null) {
             mFormDatabase = new AwFormDatabase();
@@ -54,11 +48,18 @@ public class AwBrowserContext {
         return mFormDatabase;
     }
 
-    public HttpAuthDatabase getHttpAuthDatabase(Context context) {
-        if (mHttpAuthDatabase == null) {
-            mHttpAuthDatabase = new HttpAuthDatabase(context, HTTP_AUTH_DATABASE_FILE);
+    public AwServiceWorkerController getServiceWorkerController() {
+        if (mServiceWorkerController == null) {
+            mServiceWorkerController = new AwServiceWorkerController(mApplicationContext, this);
         }
-        return mHttpAuthDatabase;
+        return mServiceWorkerController;
+    }
+
+    public AwTracingController getTracingController() {
+        if (mTracingController == null) {
+            mTracingController = new AwTracingController();
+        }
+        return mTracingController;
     }
 
     /**
